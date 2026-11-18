@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Vibe")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
-[assembly: AssemblyVersion("2.4.0.0")]
-[assembly: AssemblyFileVersion("2.4.0.0")]
+[assembly: AssemblyVersion("2.5.0.0")]
+[assembly: AssemblyFileVersion("2.5.0.0")]
 
 namespace StopProcessing
 {
@@ -33,7 +33,7 @@ namespace StopProcessing
     static class AppInfo
     {
         public const string Owner = "jhfarhanyt20-coder";
-        public const string Repo = "stop-processing";
+        public const string Repo = "Vibe-stop-processing";
         public const string AssetName = "StopProcessing.exe";
 
         public static Version Version
@@ -148,17 +148,25 @@ namespace StopProcessing
             try
             {
                 // 1. find the newest tag from the /releases/latest redirect (not rate limited)
-                var head = Request("https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest");
-                head.AllowAutoRedirect = false;
-                head.Method = "HEAD";
-                string location;
-                using (var r = (HttpWebResponse)head.GetResponse())
-                    location = r.Headers["Location"];
-                if (string.IsNullOrEmpty(location) || location.IndexOf("/tag/") < 0) return FetchLatestFromApi();
+                // follow redirects by hand (also covers a renamed repository) until we reach .../tag/<version>
+                string location = "https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest";
+                for (int hop = 0; hop < 5 && location.IndexOf("/tag/") < 0; hop++)
+                {
+                    var head = Request(location);
+                    head.AllowAutoRedirect = false;
+                    head.Method = "HEAD";
+                    string next;
+                    using (var r = (HttpWebResponse)head.GetResponse())
+                        next = r.Headers["Location"];
+                    if (string.IsNullOrEmpty(next)) break;
+                    location = new Uri(new Uri(location), next).ToString();
+                }
+                if (location.IndexOf("/tag/") < 0) return FetchLatestFromApi();
+                string repoBase = location.Substring(0, location.IndexOf("/releases/"));
                 string tag = Uri.UnescapeDataString(location.Substring(location.LastIndexOf("/tag/") + 5));
 
                 // 2. read that release's latest.json
-                var req = Request("https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/download/" + tag + "/latest.json");
+                var req = Request(repoBase + "/releases/download/" + tag + "/latest.json");
                 string json;
                 using (var resp = req.GetResponse())
                 using (var sr = new StreamReader(resp.GetResponseStream()))

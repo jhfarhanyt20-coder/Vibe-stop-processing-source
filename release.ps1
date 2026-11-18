@@ -51,7 +51,7 @@ $exe = Get-Item StopProcessing.exe
 $manifest = [ordered]@{
     version = $Version
     notes   = $Notes
-    url     = "https://github.com/jhfarhanyt20-coder/stop-processing/releases/download/v$Version/StopProcessing.exe"
+    url     = "https://github.com/jhfarhanyt20-coder/Vibe-stop-processing/releases/download/v$Version/StopProcessing.exe"
     size    = $exe.Length
     sha256  = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
 }

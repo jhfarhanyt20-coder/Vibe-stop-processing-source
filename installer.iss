@@ -7,7 +7,7 @@
 
 #define AppName "Vibe Stop Processing"
 #define AppExe "StopProcessing.exe"
-#define AppUrl "https://github.com/jhfarhanyt20-coder/stop-processing"
+#define AppUrl "https://github.com/jhfarhanyt20-coder/Vibe-stop-processing"
 
 [Setup]
 ; Never change AppId - Windows uses it to recognise upgrades and the uninstaller.
