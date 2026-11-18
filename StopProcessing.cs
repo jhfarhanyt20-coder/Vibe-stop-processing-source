@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Vibe")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 
 namespace StopProcessing
 {
@@ -132,8 +132,37 @@ namespace StopProcessing
             return req;
         }
 
-        /// Reads the latest GitHub release. Returns null if there is none.
+        /// Reads latest.json from the newest GitHub release (no API rate limit).
+        /// Falls back to the GitHub API if the release has no latest.json.
         public static UpdateInfo FetchLatest()
+        {
+            try
+            {
+                var req = Request("https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest/download/latest.json");
+                string json;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    json = sr.ReadToEnd();
+                var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+                Version v;
+                if (!Version.TryParse(Convert.ToString(d["version"]), out v)) return null;
+                return new UpdateInfo
+                {
+                    Version = v,
+                    Tag = "v" + Convert.ToString(d["version"]),
+                    Notes = d.ContainsKey("notes") ? Convert.ToString(d["notes"]) : "",
+                    Url = Convert.ToString(d["url"]),
+                    Size = d.ContainsKey("size") ? Convert.ToInt64(d["size"]) : 0,
+                    Sha256 = d.ContainsKey("sha256") ? Convert.ToString(d["sha256"]).ToLowerInvariant() : null
+                };
+            }
+            catch (WebException)
+            {
+                return FetchLatestFromApi();
+            }
+        }
+
+        private static UpdateInfo FetchLatestFromApi()
         {
             var req = Request("https://api.github.com/repos/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest");
             req.Accept = "application/vnd.github+json";
@@ -224,12 +253,26 @@ namespace StopProcessing
                 using (var sha = SHA256.Create())
                 using (var fs = File.OpenRead(tmp))
                     hash = BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
-                if (hash != i.Sha256) { File.Delete(tmp); throw new Exception("Checksum did not match — update rejected."); }
+                if (hash != i.Sha256) { File.Delete(tmp); throw new Exception("Checksum did not match \u2014 update rejected."); }
             }
             return tmp;
         }
 
         /// Swaps the running exe for the downloaded one (Windows allows renaming a running exe).
+        /// Keeps "Apps & features" showing the right version after an in-app update.
+        public static void UpdateInstalledVersion(Version v)
+        {
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A71-5B4E-4D2A-9C61-7E2B5A9D4F10}_is1", true))
+                {
+                    if (k != null) k.SetValue("DisplayVersion", v.Major + "." + v.Minor + "." + Math.Max(0, v.Build));
+                }
+            }
+            catch { }
+        }
+
         public static void Apply(string downloaded)
         {
             string old = Exe + ".old";
@@ -576,7 +619,7 @@ namespace StopProcessing
             Theme.FillRound(g, fill, new Rectangle(0, 0, Width - 1, Height - 1), Radius);
 
             Color fc = Enabled ? Fore : Theme.Faint;
-            var tf = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter;
+            var tf = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
             Size ts = TextRenderer.MeasureText(g, Text, Font, Size.Empty, tf);
             int gw = 0;
             Font gf = Theme.Icon(Font.Size * 1.0f);
@@ -637,7 +680,7 @@ namespace StopProcessing
             if (on)
             {
                 Theme.FillRound(g, Theme.Blue, r, 5);
-                TextRenderer.DrawText(g, "", Theme.Icon(9f), r, Color.White,
+                TextRenderer.DrawText(g, "\uE73E", Theme.Icon(9f), r, Color.White,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
             else
@@ -782,7 +825,7 @@ namespace StopProcessing
     class CleanRow : Control
     {
         public string Glyph, Desc;
-        private string size = "—", status = "";
+        private string size = "\u2014", status = "";
         private bool chk, hot;
 
         public CleanRow(string glyph, string title, string desc, bool on)
@@ -837,7 +880,7 @@ namespace StopProcessing
     {
         public string Glyph, Desc;
         private CheckState2 state = CheckState2.Unknown;
-        private string stateText = "Checking…";
+        private string stateText = "Checking\u2026";
 
         public StatusRow(string glyph, string title, string desc)
         {
@@ -846,7 +889,7 @@ namespace StopProcessing
             Glyph = glyph;
             Text = title;
             Desc = desc;
-            Height = 62;
+            Height = 54;
             Dock = DockStyle.Top;
         }
 
@@ -878,8 +921,8 @@ namespace StopProcessing
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             int textW = pill.X - 64 - 12;
-            TextRenderer.DrawText(g, Text, Theme.Semi(10f), new Rectangle(64, 12, textW, 20), Theme.Text, tf);
-            TextRenderer.DrawText(g, Desc, Theme.F(8.5f), new Rectangle(64, 33, textW, 18), Theme.Faint, tf);
+            TextRenderer.DrawText(g, Text, Theme.Semi(10f), new Rectangle(64, 8, textW, 20), Theme.Text, tf);
+            TextRenderer.DrawText(g, Desc, Theme.F(8.5f), new Rectangle(64, 29, textW, 18), Theme.Faint, tf);
 
             using (var pen = new Pen(Color.FromArgb(37, 41, 49)))
                 g.DrawLine(pen, 14, Height - 1, Width - 14, Height - 1);
@@ -1075,7 +1118,10 @@ namespace StopProcessing
             pages.Add(BuildSettingsPage());
             foreach (var p in pages) contentHost.Controls.Add(p);
 
-            ShowPage(0);
+            int startPage = 0;
+            foreach (var arg in Environment.GetCommandLineArgs())
+                if (arg.StartsWith("--page=")) int.TryParse(arg.Substring(7), out startPage);
+            ShowPage(Math.Max(0, Math.Min(pages.Count - 1, startPage)));
             StartTimer();
         }
 
@@ -1141,10 +1187,10 @@ namespace StopProcessing
             nav.Size = new Size(214, 700);
             string[][] items =
             {
-                new[] { "", "Processes" },
-                new[] { "", "Cleaner" },
-                new[] { "", "Power Fix" },
-                new[] { "", "Settings" }
+                new[] { "\uE9D9", "Processes" },
+                new[] { "\uE74D", "Cleaner" },
+                new[] { "\uE7E8", "Power Fix" },
+                new[] { "\uE713", "Settings" }
             };
             for (int i = 0; i < items.Length; i++)
             {
@@ -1162,7 +1208,7 @@ namespace StopProcessing
             var quickShutdown = new FlatButton
             {
                 Text = "Shut Down PC",
-                Glyph = "",
+                Glyph = "\uE7E8",
                 Bounds = new Rectangle(14, nav.Height - 16 - 44, nav.Width - 29, 44),
                 Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
                 Font = Theme.Semi(9.5f)
@@ -1176,9 +1222,9 @@ namespace StopProcessing
 
             // title bar
             var title = new TitleBar(this) { Dock = DockStyle.Top, Height = 40 };
-            var closeB = new CaptionButton("", true) { Dock = DockStyle.Right };
-            maxButton = new CaptionButton("", false) { Dock = DockStyle.Right };
-            var minB = new CaptionButton("", false) { Dock = DockStyle.Right };
+            var closeB = new CaptionButton("\uE8BB", true) { Dock = DockStyle.Right };
+            maxButton = new CaptionButton("\uE922", false) { Dock = DockStyle.Right };
+            var minB = new CaptionButton("\uE921", false) { Dock = DockStyle.Right };
             closeB.Click += (s, e) => Close();
             maxButton.Click += (s, e) => ToggleMaximize();
             minB.Click += (s, e) => WindowState = FormWindowState.Minimized;
@@ -1212,7 +1258,7 @@ namespace StopProcessing
             base.OnResize(e);
             if (maxButton != null)
             {
-                maxButton.Glyph = WindowState == FormWindowState.Maximized ? "" : "";
+                maxButton.Glyph = WindowState == FormWindowState.Maximized ? "\uE923" : "\uE922";
                 maxButton.Invalidate();
                 Padding = WindowState == FormWindowState.Maximized ? new Padding(0) : new Padding(1);
             }
@@ -1263,7 +1309,8 @@ namespace StopProcessing
                 Dock = DockStyle.Fill,
                 TextAlign = align,
                 Margin = new Padding(0),
-                AutoEllipsis = true
+                AutoEllipsis = true,
+                UseMnemonic = false
             };
         }
 
@@ -1319,7 +1366,7 @@ namespace StopProcessing
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 116F));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            procHeader = new PageHeader("Processes", "Live process monitor — pick what stays, stop the rest.") { Dock = DockStyle.Fill };
+            procHeader = new PageHeader("Processes", "Live process monitor \u2014 pick what stays, stop the rest.") { Dock = DockStyle.Fill };
 
             var stats = Table(4, 1, Theme.Bg);
             for (int i = 0; i < 4; i++) stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25F));
@@ -1481,7 +1528,7 @@ namespace StopProcessing
                 Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
             desc.AutoEllipsis = false;
 
-            stopButton = new FlatButton { Text = "Stop All Processes", Glyph = "", Dock = DockStyle.Fill, Height = 50, Margin = new Padding(0, 2, 0, 4) };
+            stopButton = new FlatButton { Text = "Stop All Processes", Glyph = "\uE71A", Dock = DockStyle.Fill, Height = 50, Margin = new Padding(0, 2, 0, 4) };
             stopButton.SetColor(Theme.Red);
             stopButton.Click += StopButton_Click;
 
@@ -1637,7 +1684,7 @@ namespace StopProcessing
 
             isStopping = true;
             stopButton.Enabled = false;
-            stopButton.Text = "Stopping…";
+            stopButton.Text = "Stopping\u2026";
             stopProgress.Maximum = Math.Max(1, targets.Count);
             stopProgress.Value = 0;
             stopLog.Items.Clear();
@@ -1661,8 +1708,8 @@ namespace StopProcessing
                     Ui(() =>
                     {
                         stopProgress.Value = d;
-                        procHeader.Subtitle = nm + " — " + r + "   (" + d + " / " + targets.Count + ")";
-                        AddLog(stopLog, nm + " → " + r);
+                        procHeader.Subtitle = nm + " \u2014 " + r + "   (" + d + " / " + targets.Count + ")";
+                        AddLog(stopLog, nm + " \u2192 " + r);
                     });
                     Thread.Sleep(200);
                 }
@@ -1759,22 +1806,22 @@ namespace StopProcessing
             string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             string pd = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
 
-            cleanTargets.Add(new CleanTarget { Name = "User temp files", Glyph = "", DefaultOn = true,
-                Desc = "%TEMP% — leftovers from apps and installers", Dirs = new[] { Path.GetTempPath() } });
-            cleanTargets.Add(new CleanTarget { Name = "Windows temp files", Glyph = "", DefaultOn = true,
+            cleanTargets.Add(new CleanTarget { Name = "User temp files", Glyph = "\uE8B7", DefaultOn = true,
+                Desc = "%TEMP% \u2014 leftovers from apps and installers", Dirs = new[] { Path.GetTempPath() } });
+            cleanTargets.Add(new CleanTarget { Name = "Windows temp files", Glyph = "\uE8B7", DefaultOn = true,
                 Desc = Path.Combine(win, "Temp"), Dirs = new[] { Path.Combine(win, "Temp") } });
-            cleanTargets.Add(new CleanTarget { Name = "Thumbnail cache", Glyph = "", DefaultOn = true,
-                Desc = "Explorer thumbnails — rebuilt automatically", Pattern = "thumbcache_*.db",
+            cleanTargets.Add(new CleanTarget { Name = "Thumbnail cache", Glyph = "\uE91B", DefaultOn = true,
+                Desc = "Explorer thumbnails \u2014 rebuilt automatically", Pattern = "thumbcache_*.db",
                 Dirs = new[] { Path.Combine(local, @"Microsoft\Windows\Explorer") } });
-            cleanTargets.Add(new CleanTarget { Name = "Crash dumps and error reports", Glyph = "", DefaultOn = true,
+            cleanTargets.Add(new CleanTarget { Name = "Crash dumps and error reports", Glyph = "\uE7BA", DefaultOn = true,
                 Desc = "Old crash dumps and Windows Error Reporting files",
                 Dirs = new[] { Path.Combine(local, "CrashDumps"), Path.Combine(pd, @"Microsoft\Windows\WER\ReportArchive"),
                                Path.Combine(pd, @"Microsoft\Windows\WER\ReportQueue") } });
-            cleanTargets.Add(new CleanTarget { Name = "Windows Update cache", Glyph = "", DefaultOn = false,
+            cleanTargets.Add(new CleanTarget { Name = "Windows Update cache", Glyph = "\uE896", DefaultOn = false,
                 Desc = "Update files that were already downloaded", Dirs = new[] { Path.Combine(win, @"SoftwareDistribution\Download") } });
-            cleanTargets.Add(new CleanTarget { Name = "Prefetch data", Glyph = "", DefaultOn = false,
-                Desc = "Launch cache — apps may open a bit slower once", Dirs = new[] { Path.Combine(win, "Prefetch") } });
-            cleanTargets.Add(new CleanTarget { Name = "Recycle Bin", Glyph = "", DefaultOn = false, Recycle = true,
+            cleanTargets.Add(new CleanTarget { Name = "Prefetch data", Glyph = "\uE945", DefaultOn = false,
+                Desc = "Launch cache \u2014 apps may open a bit slower once", Dirs = new[] { Path.Combine(win, "Prefetch") } });
+            cleanTargets.Add(new CleanTarget { Name = "Recycle Bin", Glyph = "\uE74D", DefaultOn = false, Recycle = true,
                 Desc = "Permanently empties the Recycle Bin", Dirs = new string[0] });
         }
 
@@ -1828,14 +1875,14 @@ namespace StopProcessing
             t2.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             t2.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            cleanTotal = MakeLabel("—", Theme.F(22f, FontStyle.Bold), Theme.Text);
-            cleanTotalHint = MakeLabel("Scanning…", Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
+            cleanTotal = MakeLabel("\u2014", Theme.F(22f, FontStyle.Bold), Theme.Text);
+            cleanTotalHint = MakeLabel("Scanning\u2026", Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
 
-            cleanButton = new FlatButton { Text = "Clean Now", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 6) };
+            cleanButton = new FlatButton { Text = "Clean Now", Glyph = "\uE74D", Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 6) };
             cleanButton.SetColor(Theme.Blue);
             cleanButton.Click += (s, e) => StartClean();
 
-            scanButton = new FlatButton { Text = "Scan Again", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6), Font = Theme.Semi(9.5f) };
+            scanButton = new FlatButton { Text = "Scan Again", Glyph = "\uE721", Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6), Font = Theme.Semi(9.5f) };
             scanButton.SetColor(Theme.Secondary);
             scanButton.Click += (s, e) => StartScan();
 
@@ -1932,8 +1979,8 @@ namespace StopProcessing
         {
             if (isCleaning) return;
             SetCleanBusy(true);
-            cleanTotalHint.Text = "Scanning…";
-            foreach (var t in cleanTargets) { t.Row.SizeText = "…"; t.Row.StatusText = ""; }
+            cleanTotalHint.Text = "Scanning\u2026";
+            foreach (var t in cleanTargets) { t.Row.SizeText = "\u2026"; t.Row.StatusText = ""; }
 
             var th = new Thread(() =>
             {
@@ -1982,7 +2029,7 @@ namespace StopProcessing
             }
 
             SetCleanBusy(true);
-            cleanButton.Text = "Cleaning…";
+            cleanButton.Text = "Cleaning\u2026";
             cleanLog.Items.Clear();
             cleanSummary.Text = "";
             cleanProgress.Value = 0;
@@ -2016,7 +2063,7 @@ namespace StopProcessing
                     var t = kv.Key;
                     long freed = 0;
                     int deleted = 0, skipped = 0;
-                    Ui(() => { t.Row.StatusText = "Cleaning…"; });
+                    Ui(() => { t.Row.StatusText = "Cleaning\u2026"; });
 
                     if (t.Recycle)
                     {
@@ -2050,7 +2097,7 @@ namespace StopProcessing
                                 Ui(() => AddLog(cleanLog, "Skipped (in use): " + shortName));
                                 if (!skipAll)
                                 {
-                                    int a = AskOnUi("File in use — skip it?",
+                                    int a = AskOnUi("File in use \u2014 skip it?",
                                         "This file is open in another program or protected, so it can't be deleted right now:\n\n" +
                                         f + "\n\n" + ex.Message,
                                         new[] { "Skip", "Skip All", "Stop Cleaning" }, 1, Theme.Blue);
@@ -2081,7 +2128,7 @@ namespace StopProcessing
                     Ui(() =>
                     {
                         cleanProgress.Value = pr2;
-                        t.Row.StatusText = "Freed " + Theme.FormatBytes(fr) + (sk > 0 ? " · " + sk + " skipped" : "");
+                        t.Row.StatusText = "Freed " + Theme.FormatBytes(fr) + (sk > 0 ? " \u00B7 " + sk + " skipped" : "");
                         AddLog(cleanLog, t.Name + ": " + de.ToString("N0") + " deleted, " + sk + " skipped, " + Theme.FormatBytes(fr) + " freed");
                     });
                 }
@@ -2094,7 +2141,7 @@ namespace StopProcessing
                     cleanProgress.Value = cleanProgress.Maximum;
                     cleanButton.Text = "Clean Now";
                     cleanSummary.Text = (stopped ? "Stopped. " : "Done! ") + "Freed " + Theme.FormatBytes(fa) + "\n" +
-                                        da.ToString("N0") + " deleted · " + sa.ToString("N0") + " skipped (in use)";
+                                        da.ToString("N0") + " deleted \u00B7 " + sa.ToString("N0") + " skipped (in use)";
                     cleanHeader.Subtitle = "Last clean freed " + Theme.FormatBytes(fa) + ".";
                     AddLog(cleanLog, "Finished. Freed " + Theme.FormatBytes(fa) + ".");
                     SetCleanBusy(false);
@@ -2109,7 +2156,7 @@ namespace StopProcessing
         {
             var keep = cleanTargets.ToDictionary(t => t, t => t.Row.StatusText);
             StartScan();
-            // keep the "Freed …" status visible after the rescan finishes
+            // keep the "Freed \u2026" status visible after the rescan finishes
             var timer = new System.Windows.Forms.Timer { Interval = 300 };
             timer.Tick += (s, e) =>
             {
@@ -2148,7 +2195,7 @@ namespace StopProcessing
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
             powerHeader = new PageHeader("Power Fix",
-                "PC turns itself back on after shutdown? Find and switch off what wakes it — in one click.") { Dock = DockStyle.Fill };
+                "PC turns itself back on after shutdown? Find and switch off what wakes it \u2014 in one click.") { Dock = DockStyle.Fill };
 
             var body = Table(2, 1, Theme.Bg);
             body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
@@ -2156,22 +2203,22 @@ namespace StopProcessing
 
             var left = Table(1, 2, Theme.Bg);
             left.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            left.RowStyles.Add(new RowStyle(SizeType.Absolute, 132F));
+            left.RowStyles.Add(new RowStyle(SizeType.Absolute, 118F));
             left.Margin = new Padding(0, 0, 14, 0);
 
             var checksCard = new Card { Dock = DockStyle.Fill, Padding = new Padding(8, 14, 8, 8), Margin = new Padding(0, 0, 0, 14) };
             var checksHost = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Card, AutoScroll = true };
-            rowFastStartup = new StatusRow("", "Fast Startup",
-                "Hybrid shutdown — the PC only half shuts down and can wake back up");
-            rowWakeTimers = new StatusRow("", "Wake timers",
+            rowFastStartup = new StatusRow("\uE945", "Fast Startup",
+                "Hybrid shutdown \u2014 the PC only half shuts down and can wake back up");
+            rowWakeTimers = new StatusRow("\uE823", "Wake timers",
                 "Scheduled tasks and apps are allowed to power the PC on");
-            rowWakeDevices = new StatusRow("", "Devices allowed to wake the PC",
+            rowWakeDevices = new StatusRow("\uE765", "Devices allowed to wake the PC",
                 "Network card (Wake-on-LAN), mouse or keyboard can turn it on");
-            rowMaintenance = new StatusRow("", "Automatic maintenance wake-up",
+            rowMaintenance = new StatusRow("\uE713", "Automatic maintenance wake-up",
                 "Windows wakes the PC at night to run maintenance");
-            rowArso = new StatusRow("", "Auto sign-in after updates",
+            rowArso = new StatusRow("\uE895", "Auto sign-in after updates",
                 "Windows restarts and signs in by itself to finish updates");
-            rowAutoReboot = new StatusRow("", "Restart on system failure",
+            rowAutoReboot = new StatusRow("\uE777", "Restart on system failure",
                 "If shutdown crashes, Windows reboots instead of staying off");
             var rows = new[] { rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowArso, rowAutoReboot };
             for (int i = rows.Length - 1; i >= 0; i--) checksHost.Controls.Add(rows[i]);
@@ -2191,7 +2238,7 @@ namespace StopProcessing
             noteT.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             var noteBody = MakeLabel(
                 "Some causes live in the BIOS/UEFI and can't be changed from Windows. Restart, open BIOS (usually Del or F2) and set: " +
-                "Restore on AC Power Loss → Power Off,  Wake on LAN / PCIe (PME) → Disabled,  RTC / Alarm wake → Disabled,  ErP → Enabled.",
+                "Restore on AC Power Loss \u2192 Power Off,  Wake on LAN / PCIe (PME) \u2192 Disabled,  RTC / Alarm wake \u2192 Disabled,  ErP \u2192 Enabled.",
                 Theme.F(9f), Theme.Soft, ContentAlignment.TopLeft);
             noteBody.AutoEllipsis = false;
             noteT.Controls.Add(MakeLabel("Still turning on by itself?", Theme.Semi(10f), Theme.Amber), 0, 0);
@@ -2218,19 +2265,19 @@ namespace StopProcessing
                 Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
             desc.AutoEllipsis = false;
 
-            fixButton = new FlatButton { Text = "Fix Auto Power-On", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 6) };
+            fixButton = new FlatButton { Text = "Fix Auto Power-On", Glyph = "\uE90F", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 6) };
             fixButton.SetColor(Theme.Blue);
             fixButton.Click += (s, e) => RunPowerFix(true);
 
-            restoreButton = new FlatButton { Text = "Restore Defaults", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6), Font = Theme.Semi(9.5f) };
+            restoreButton = new FlatButton { Text = "Restore Defaults", Glyph = "\uE7A7", Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6), Font = Theme.Semi(9.5f) };
             restoreButton.SetColor(Theme.Secondary);
             restoreButton.Click += (s, e) => RunPowerFix(false);
 
-            recheckButton = new FlatButton { Text = "Check Again", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6), Font = Theme.Semi(9.5f) };
+            recheckButton = new FlatButton { Text = "Check Again", Glyph = "\uE72C", Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6), Font = Theme.Semi(9.5f) };
             recheckButton.SetColor(Theme.Secondary);
             recheckButton.Click += (s, e) => CheckPowerAsync();
 
-            fullShutdownButton = new FlatButton { Text = "Full Shut Down Now", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 4) };
+            fullShutdownButton = new FlatButton { Text = "Full Shut Down Now", Glyph = "\uE7E8", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 4) };
             fullShutdownButton.SetColor(Theme.Red);
             fullShutdownButton.Click += (s, e) => FullShutdown();
 
@@ -2312,7 +2359,7 @@ namespace StopProcessing
         {
             if (isPowerBusy) return;
             foreach (var r in new[] { rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowArso, rowAutoReboot })
-                r.SetState(CheckState2.Unknown, "Checking…");
+                r.SetState(CheckState2.Unknown, "Checking\u2026");
 
             var th = new Thread(() =>
             {
@@ -2350,7 +2397,7 @@ namespace StopProcessing
                     else { rowAutoReboot.SetState(CheckState2.Risk, "On"); risks++; }
 
                     powerHeader.Subtitle = risks == 0
-                        ? "All clear — Windows can't turn your PC back on by itself."
+                        ? "All clear \u2014 Windows can't turn your PC back on by itself."
                         : risks + " setting" + (risks == 1 ? "" : "s") + " can turn your PC back on. Press \"Fix Auto Power-On\".";
                 });
             });
@@ -2373,12 +2420,12 @@ namespace StopProcessing
             {
                 int a = ThemedDialog.Show(this, "Fix auto power-on?",
                     "This will:\n" +
-                    "•  turn off Fast Startup (shutdown becomes a real, full shutdown)\n" +
-                    "•  disable wake timers\n" +
-                    "•  stop the network card, mouse and keyboard from waking the PC\n" +
-                    "•  turn off maintenance wake-up and auto sign-in after updates\n" +
-                    "•  stay off instead of rebooting after a crash\n\n" +
-                    "Note: you won't be able to wake the PC from Sleep with the mouse or keyboard — use the power button. " +
+                    "\u2022  turn off Fast Startup (shutdown becomes a real, full shutdown)\n" +
+                    "\u2022  disable wake timers\n" +
+                    "\u2022  stop the network card, mouse and keyboard from waking the PC\n" +
+                    "\u2022  turn off maintenance wake-up and auto sign-in after updates\n" +
+                    "\u2022  stay off instead of rebooting after a crash\n\n" +
+                    "Note: you won't be able to wake the PC from Sleep with the mouse or keyboard \u2014 use the power button. " +
                     "You can undo everything with \"Restore Defaults\".",
                     new[] { "Apply Fix", "Cancel" }, 0, Theme.Blue);
                 if (a != 0) return;
@@ -2404,9 +2451,9 @@ namespace StopProcessing
                 {
                     if (fix)
                     {
-                        Step(log, "Fast Startup → off", () => WriteDword(KeyPower, "HiberbootEnabled", 0));
+                        Step(log, "Fast Startup \u2192 off", () => WriteDword(KeyPower, "HiberbootEnabled", 0));
 
-                        Step(log, "Wake timers → disabled", () =>
+                        Step(log, "Wake timers \u2192 disabled", () =>
                         {
                             Native.Run("powercfg.exe", "/setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 0", out code);
                             Native.Run("powercfg.exe", "/setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 0", out code);
@@ -2432,15 +2479,15 @@ namespace StopProcessing
                         }
                         if (devices.Count == 0) log("No devices were allowed to wake the PC.");
 
-                        Step(log, "Maintenance wake-up → off", () => WriteDword(KeyMaint, "WakeUp", 0));
-                        Step(log, "Auto sign-in after updates → off", () => WriteDword(KeyArso, "DisableAutomaticRestartSignOn", 1));
-                        Step(log, "Restart on system failure → off", () => WriteDword(KeyCrash, "AutoReboot", 0));
+                        Step(log, "Maintenance wake-up \u2192 off", () => WriteDword(KeyMaint, "WakeUp", 0));
+                        Step(log, "Auto sign-in after updates \u2192 off", () => WriteDword(KeyArso, "DisableAutomaticRestartSignOn", 1));
+                        Step(log, "Restart on system failure \u2192 off", () => WriteDword(KeyCrash, "AutoReboot", 0));
                         log("Done. Use \"Full Shut Down\" for a clean power-off.");
                     }
                     else
                     {
-                        Step(log, "Fast Startup → on", () => WriteDword(KeyPower, "HiberbootEnabled", 1));
-                        Step(log, "Wake timers → enabled", () =>
+                        Step(log, "Fast Startup \u2192 on", () => WriteDword(KeyPower, "HiberbootEnabled", 1));
+                        Step(log, "Wake timers \u2192 enabled", () =>
                         {
                             Native.Run("powercfg.exe", "/setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1", out code);
                             Native.Run("powercfg.exe", "/setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1", out code);
@@ -2456,9 +2503,9 @@ namespace StopProcessing
                             }
                             try { File.Delete(WakeListFile); } catch { }
                         }
-                        Step(log, "Maintenance wake-up → on", () => WriteDword(KeyMaint, "WakeUp", 1));
-                        Step(log, "Auto sign-in after updates → default", () => DeleteValue(KeyArso, "DisableAutomaticRestartSignOn"));
-                        Step(log, "Restart on system failure → on", () => WriteDword(KeyCrash, "AutoReboot", 1));
+                        Step(log, "Maintenance wake-up \u2192 on", () => WriteDword(KeyMaint, "WakeUp", 1));
+                        Step(log, "Auto sign-in after updates \u2192 default", () => DeleteValue(KeyArso, "DisableAutomaticRestartSignOn"));
+                        Step(log, "Restart on system failure \u2192 on", () => WriteDword(KeyCrash, "AutoReboot", 1));
                         log("Defaults restored.");
                     }
                 }
@@ -2478,8 +2525,8 @@ namespace StopProcessing
 
         private static void Step(Action<string> log, string label, Action a)
         {
-            try { a(); log("✓ " + label); }
-            catch (Exception ex) { log("✗ " + label + " — " + ex.Message); }
+            try { a(); log("\u2713 " + label); }
+            catch (Exception ex) { log("\u2717 " + label + " \u2014 " + ex.Message); }
         }
 
         private void FullShutdown()
@@ -2545,10 +2592,10 @@ namespace StopProcessing
             var btnRow = Table(2, 1, Theme.Card);
             btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
             btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
-            checkUpdateButton = new FlatButton { Text = "Check for Updates", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 8, 6, 8), Font = Theme.Semi(9.5f) };
+            checkUpdateButton = new FlatButton { Text = "Check for Updates", Glyph = "\uE72C", Dock = DockStyle.Fill, Margin = new Padding(0, 8, 6, 8), Font = Theme.Semi(9.5f) };
             checkUpdateButton.SetColor(Theme.Secondary);
             checkUpdateButton.Click += (s, e) => CheckForUpdates(true);
-            installUpdateButton = new FlatButton { Text = "Install Update", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(6, 8, 0, 8), Font = Theme.Semi(9.5f), Enabled = false };
+            installUpdateButton = new FlatButton { Text = "Install Update", Glyph = "\uE896", Dock = DockStyle.Fill, Margin = new Padding(6, 8, 0, 8), Font = Theme.Semi(9.5f), Enabled = false };
             installUpdateButton.SetColor(Theme.Blue);
             installUpdateButton.Click += (s, e) => InstallUpdate(false);
             btnRow.Controls.Add(checkUpdateButton, 0, 0);
@@ -2597,10 +2644,10 @@ namespace StopProcessing
             var desc = MakeLabel("Closes apps before shutdown, cleans temporary files and stops your PC from turning itself back on.",
                 Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
             desc.AutoEllipsis = false;
-            var site = new FlatButton { Text = "Website & Downloads", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 6), Font = Theme.Semi(9.5f) };
+            var site = new FlatButton { Text = "Website & Downloads", Glyph = "\uE774", Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 6), Font = Theme.Semi(9.5f) };
             site.SetColor(Theme.Secondary);
             site.Click += (s, e) => { try { Process.Start(AppInfo.RepoUrl); } catch { } };
-            var lic = MakeLabel("© 2026 Vibe. All rights reserved.\nLicensed for personal use only. Modifying, " +
+            var lic = MakeLabel("\u00A9 2026 Vibe. All rights reserved.\nLicensed for personal use only. Modifying, " +
                 "reverse-engineering or redistributing this software is not allowed.", Theme.F(8.5f), Theme.Faint, ContentAlignment.TopLeft);
             lic.AutoEllipsis = false;
 
@@ -2637,7 +2684,7 @@ namespace StopProcessing
             if (isUpdating || updateInstalled) return;
             isUpdating = true;
             checkUpdateButton.Enabled = false;
-            SetUpdateStatus("Checking for updates…", Theme.Muted);
+            SetUpdateStatus("Checking for updates\u2026", Theme.Muted);
 
             var th = new Thread(() =>
             {
@@ -2709,7 +2756,7 @@ namespace StopProcessing
             installUpdateButton.Enabled = false;
             updProgress.Maximum = 100;
             updProgress.Value = 0;
-            SetUpdateStatus("Downloading " + info.Tag + "…", Theme.Blue);
+            SetUpdateStatus("Downloading " + info.Tag + "\u2026", Theme.Blue);
 
             var th = new Thread(() =>
             {
@@ -2718,6 +2765,7 @@ namespace StopProcessing
                 {
                     string file = Updater.Download(info, p => Ui(() => updProgress.Value = p));
                     Updater.Apply(file);
+                    Updater.UpdateInstalledVersion(info.Version);
                 }
                 catch (Exception ex) { error = ex.Message; }
 
@@ -2738,7 +2786,7 @@ namespace StopProcessing
                     updateInstalled = true;
                     navItems[3].Badge = false;
                     updProgress.Value = 100;
-                    SetUpdateStatus("Update installed — restart to finish", Theme.Green);
+                    SetUpdateStatus("Update installed \u2014 restart to finish", Theme.Green);
 
                     if (isStopping || isCleaning) return; // don't interrupt a running job
                     int ans = ThemedDialog.Show(this, "Update ready",
@@ -2817,7 +2865,7 @@ namespace StopProcessing
             using (var p = Theme.Round(logo, 6))
             using (var b = new LinearGradientBrush(logo, Color.FromArgb(240, 92, 70), Color.FromArgb(196, 40, 60), 45f))
                 g.FillPath(b, p);
-            TextRenderer.DrawText(g, "", Theme.Icon(8.5f), logo, Color.White,
+            TextRenderer.DrawText(g, "\uE7E8", Theme.Icon(8.5f), logo, Color.White,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             var tf = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
@@ -2872,7 +2920,7 @@ namespace StopProcessing
             using (var b = new SolidBrush(c)) g.FillEllipse(b, 14, (Height - 7) / 2, 7, 7);
             var tf = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
             TextRenderer.DrawText(g,
-                admin ? "Running as administrator" : "Limited mode — run as administrator for Power Fix and full cleaning",
+                admin ? "Running as administrator" : "Limited mode \u2014 run as administrator for Power Fix and full cleaning",
                 Theme.F(8.5f), new Rectangle(28, 0, Width - 200, Height), Theme.Muted, tf);
             TextRenderer.DrawText(g, "Vibe Stop Processing " + AppInfo.VersionText, Theme.F(8.5f), new Rectangle(0, 0, Width - 14, Height), Theme.Faint,
                 tf | TextFormatFlags.Right);

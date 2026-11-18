@@ -1,10 +1,12 @@
 # Publishes a new version of Vibe Stop Processing.
 # Rule: every release goes up by 0.1 automatically (2.1.0 -> 2.2.0 -> 2.3.0 ...).
 # Usage:  .\release.ps1 -Notes "What changed in this version"
+#         .\release.ps1 -BuildOnly      (build exe + installer locally, publish nothing)
 # Users with "Install updates automatically" on get it on their next app start.
 
 param(
-    [string]$Notes = ""
+    [string]$Notes = "",
+    [switch]$BuildOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,26 +20,52 @@ $latest = git tag --list "v*" |
     Sort-Object -Descending | Select-Object -First 1
 if ($latest) { $Version = "{0}.{1}.0" -f $latest.Major, ($latest.Minor + 1) }
 else { $Version = "1.1.0" }
-Write-Host "Releasing v$Version (previous: v$latest)" -ForegroundColor Cyan
+Write-Host "Building v$Version (previous: v$latest)" -ForegroundColor Cyan
 
-# 1. stamp the version into the source
+# 1. stamp the version into the source (source is pure ASCII, so encoding can't break text)
 $path = Join-Path $PSScriptRoot 'StopProcessing.cs'
-$cs = [IO.File]::ReadAllText($path)
+$cs = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
+if ($cs -match '[^\x00-\x7F]') { throw "StopProcessing.cs contains non-ASCII characters. Use \uXXXX escapes instead." }
 $cs = $cs -replace 'AssemblyVersion\("[\d\.]+"\)', "AssemblyVersion(`"$Version.0`")"
 $cs = $cs -replace 'AssemblyFileVersion\("[\d\.]+"\)', "AssemblyFileVersion(`"$Version.0`")"
 [IO.File]::WriteAllText($path, $cs, (New-Object Text.UTF8Encoding $false))
 
-# 2. build
+# 2. build the app
 & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ `
-    /out:StopProcessing.exe /win32manifest:app.manifest `
+    /out:StopProcessing.exe /win32manifest:app.manifest /win32icon:app.ico `
     /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll StopProcessing.cs
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
-# 3. commit, push and publish the GitHub release (the app downloads StopProcessing.exe from here)
+# 3. build the installer
+$iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+          "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+          "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) { throw "Inno Setup 6 not found. Install it with: winget install JRSoftware.InnoSetup" }
+& $iscc /Q "/DAppVersion=$Version" installer.iss
+if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+$setup = "dist\VibeStopProcessing-Setup-$Version.exe"
+
+# 4. latest.json - what the in-app updater reads (no GitHub API rate limit)
+if (-not $Notes) { $Notes = "Vibe Stop Processing v$Version" }
+$exe = Get-Item StopProcessing.exe
+$manifest = [ordered]@{
+    version = $Version
+    notes   = $Notes
+    url     = "https://github.com/jhfarhanyt20-coder/stop-processing/releases/download/v$Version/StopProcessing.exe"
+    size    = $exe.Length
+    sha256  = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+}
+[IO.File]::WriteAllText("$PSScriptRoot\dist\latest.json", ($manifest | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+
+Write-Host "Built StopProcessing.exe, $setup and dist\latest.json" -ForegroundColor Green
+if ($BuildOnly) { return }
+
+# 4. commit, push and publish the GitHub release
+#    - VibeStopProcessing-Setup-x.y.z.exe : for new users
+#    - StopProcessing.exe + latest.json   : used by the in-app auto updater
 git add -A
 git commit -m "Release v$Version"
 git push
-if (-not $Notes) { $Notes = "Vibe Stop Processing v$Version" }
-gh release create "v$Version" StopProcessing.exe --title "Vibe Stop Processing v$Version" --notes $Notes
+gh release create "v$Version" $setup StopProcessing.exe dist\latest.json --title "Vibe Stop Processing v$Version" --notes $Notes
 
 Write-Host "Released v$Version" -ForegroundColor Green
