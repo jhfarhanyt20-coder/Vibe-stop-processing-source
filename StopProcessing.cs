@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Vibe")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
 
 namespace StopProcessing
 {
@@ -138,7 +138,18 @@ namespace StopProcessing
         {
             try
             {
-                var req = Request("https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest/download/latest.json");
+                // 1. find the newest tag from the /releases/latest redirect (not rate limited)
+                var head = Request("https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest");
+                head.AllowAutoRedirect = false;
+                head.Method = "HEAD";
+                string location;
+                using (var r = (HttpWebResponse)head.GetResponse())
+                    location = r.Headers["Location"];
+                if (string.IsNullOrEmpty(location) || location.IndexOf("/tag/") < 0) return FetchLatestFromApi();
+                string tag = Uri.UnescapeDataString(location.Substring(location.LastIndexOf("/tag/") + 5));
+
+                // 2. read that release's latest.json
+                var req = Request("https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/download/" + tag + "/latest.json");
                 string json;
                 using (var resp = req.GetResponse())
                 using (var sr = new StreamReader(resp.GetResponseStream()))
