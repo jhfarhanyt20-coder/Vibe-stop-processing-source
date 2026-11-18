@@ -1,9 +1,12 @@
-# Stop Processing — PC Shutdown Assistant
+# Vibe Stop Processing: PC Shutdown Assistant
 
-A small, dark-themed Windows app to run **right before you turn your PC off**.
-Press one button and every non-system app is closed one by one. The app also cleans temporary files and fixes a PC that **turns itself back on after shutdown**.
+A dark-themed Windows app by **Vibe** to run **right before you turn your PC off**.
+Press one button and every non-system app is closed one by one. The app also cleans temporary files, fixes a PC that **turns itself back on after shutdown**, and **keeps itself up to date**.
 
-> Windows 10 / 11 · single `.exe` · no installer · built on .NET Framework 4 (already part of Windows)
+> Windows 10 / 11 · single `.exe` · no installer · runs on .NET Framework 4, which is already part of Windows
+
+## Download
+Get the latest `StopProcessing.exe` from the **[Releases page](../../releases/latest)**.
 
 ---
 
@@ -31,68 +34,58 @@ Press one button and every non-system app is closed one by one. The app also cle
 - **Clean Now** deletes everything in the ticked locations.
 - **Files that are in use are skipped.** A dialog asks **Skip / Skip All / Stop Cleaning**. You can also untick *"Ask me before skipping locked files"* to skip them silently.
 - At the end it shows how much space was freed, how many files were deleted and how many were skipped.
-- It never follows junctions or symlinks out of a temp folder.
 
 ### 3. Power Fix: PC turns back on after shutdown
-The app checks the Windows settings that can wake or restart a PC after you shut it down, and shows each one as **OK** or as a risk:
-
 | Cause | What the fix does |
 |---|---|
 | Fast Startup (hybrid shutdown) | Turns it off, so shutdown becomes a real full shutdown |
-| Wake timers | Disables them (AC and battery) |
+| Wake timers | Disables them |
 | Devices allowed to wake the PC (network card / Wake-on-LAN, mouse, keyboard) | Disables wake for each device |
 | Automatic maintenance wake-up | Turns it off |
 | Auto sign-in / restart after updates | Turns it off |
 | Restart on system failure | Turns it off, so the PC stays off if shutdown crashes |
 
-- **Fix Auto Power-On** applies all of the above in one click.
-- **Restore Defaults** undoes all of it, including re-enabling the exact devices that were disabled.
-- **Full Shut Down Now** does a proper full shutdown (`shutdown /s`).
+- **Fix Auto Power-On** applies all of the above in one click. **Restore Defaults** undoes it.
+- **Full Shut Down Now** does a proper full shutdown.
 
-> **Still turning on by itself?** Some causes live in the BIOS/UEFI. Restart into BIOS (usually `Del` or `F2`) and set
-> *Restore on AC Power Loss → Power Off*, *Wake on LAN / PCIe (PME) → Disabled*, *RTC Alarm → Disabled*, *ErP → Enabled*.
+> **Still turning on by itself?** Open the BIOS (usually `Del` or `F2`) and set *Restore on AC Power Loss → Power Off*, *Wake on LAN → Disabled*, *RTC Alarm → Disabled*, *ErP → Enabled*.
 
-> After the fix, the mouse and keyboard can no longer wake the PC from **Sleep**. Use the power button instead.
-
-### Interface
-- Custom title bar: no Windows frame. It has its own minimize, maximize and close buttons, you drag it to move the window, and double-clicking it maximizes the window.
-- Dark, card-based layout with a sidebar menu.
-- Themed dialogs instead of the default Windows message boxes.
+### 4. Settings: automatic updates
+- **Install updates automatically** is on by default. A few seconds after the app starts, it checks for a new version, downloads it and installs it, then asks whether to restart now.
+- With auto update **off**, the app tells you a new version exists and you install it yourself with **Check for Updates → Install Update**.
+- Each update is checked before it's installed: the file size, the SHA-256 checksum and whether it's a valid program. If anything fails, the old version is kept.
+- Release notes for each version are shown in the app.
 
 ---
 
 ## How to use
-
-1. Download `StopProcessing.exe` (or build it yourself, see below).
+1. Download `StopProcessing.exe` from the [Releases page](../../releases/latest).
 2. Double-click it and press **Yes** on the UAC prompt. The app needs administrator rights to change power settings and to clean `C:\Windows\Temp`.
 3. Before turning the PC off:
    - **Cleaner** → **Clean Now**
    - **Processes** → tick *Shut down PC when finished* → **Stop All Processes**
-4. If your PC wakes up on its own: **Power Fix** → **Fix Auto Power-On**, which you only need to do once.
+4. If your PC wakes up on its own: **Power Fix** → **Fix Auto Power-On**. You only need to do this once.
 
 ---
 
-## Build from source
-
-No Visual Studio needed. The C# compiler ships with Windows. Open PowerShell in the project folder and run:
+## For the publisher: releasing an update
+Bump the version, build, push and create the GitHub release with one command:
 
 ```powershell
-& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ /out:StopProcessing.exe /win32manifest:app.manifest /r:System.Windows.Forms.dll /r:System.Drawing.dll StopProcessing.cs
+.\release.ps1 -Version 2.2.0 -Notes "Added X, fixed Y"
 ```
 
-| File | Purpose |
-|---|---|
-| `StopProcessing.cs` | All of the app's source code (WinForms, C# 5) |
-| `app.manifest` | Asks Windows to run the app as administrator |
-| `StopProcessing.exe` | Ready-to-run build |
+Every installed copy finds the new release on its next start. Copies with auto update on install it themselves, and the rest show an "Update available" prompt.
+Requirements: Git and GitHub CLI (`gh`) signed in to the repository owner's account.
 
 ---
 
 ## Safety notes
 - System processes and anything inside the Windows folder are protected from **Stop All**.
-- The Cleaner only deletes inside the listed temp/cache folders. Folders that are still in use are left alone.
-- Every Power Fix change can be undone with **Restore Defaults**. The list of disabled wake devices is saved in `%LOCALAPPDATA%\StopProcessing\wake_devices.txt`.
+- The Cleaner only deletes inside the listed temp/cache folders and never follows junctions or symlinks.
+- Every Power Fix change can be undone with **Restore Defaults**.
 - Deleted temp files and an emptied Recycle Bin **cannot be recovered**.
 
 ## License
-MIT. Free to use and modify.
+**Proprietary. © 2026 Vibe. All rights reserved.**
+You may download and use the official release. You may not modify, reverse-engineer, redistribute or resell it. See [LICENSE](LICENSE).

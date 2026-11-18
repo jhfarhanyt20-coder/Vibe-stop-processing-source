@@ -12,10 +12,260 @@ using System.Security.Principal;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using System.Net;
+using System.Security.Cryptography;
+using System.Web.Script.Serialization;
 using Microsoft.Win32;
+
+[assembly: AssemblyTitle("Vibe Stop Processing")]
+[assembly: AssemblyProduct("Vibe Stop Processing")]
+[assembly: AssemblyCompany("Vibe")]
+[assembly: AssemblyDescription("PC Shutdown Assistant")]
+[assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
 
 namespace StopProcessing
 {
+    // ------------------------------------------------------------------
+    //  App info, settings and the GitHub-Releases based updater
+    // ------------------------------------------------------------------
+    static class AppInfo
+    {
+        public const string Owner = "jhfarhanyt20-coder";
+        public const string Repo = "stop-processing";
+        public const string AssetName = "StopProcessing.exe";
+
+        public static Version Version
+        {
+            get { return Assembly.GetExecutingAssembly().GetName().Version; }
+        }
+
+        public static string VersionText
+        {
+            get { var v = Version; return v.Major + "." + v.Minor + "." + Math.Max(0, v.Build); }
+        }
+
+        public static string RepoUrl
+        {
+            get { return "https://github.com/" + Owner + "/" + Repo; }
+        }
+
+        public static string DataDir
+        {
+            get
+            {
+                string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StopProcessing");
+                Directory.CreateDirectory(d);
+                return d;
+            }
+        }
+    }
+
+    class AppSettings
+    {
+        public bool AutoUpdate = true;
+        public DateTime LastCheck = DateTime.MinValue;
+
+        private static string FilePath { get { return Path.Combine(AppInfo.DataDir, "settings.ini"); } }
+
+        public static AppSettings Load()
+        {
+            var s = new AppSettings();
+            try
+            {
+                if (!File.Exists(FilePath)) return s;
+                foreach (var line in File.ReadAllLines(FilePath))
+                {
+                    int i = line.IndexOf('=');
+                    if (i <= 0) continue;
+                    string k = line.Substring(0, i).Trim(), v = line.Substring(i + 1).Trim();
+                    if (k == "AutoUpdate") s.AutoUpdate = v != "0";
+                    else if (k == "LastCheck")
+                    {
+                        long ticks;
+                        if (long.TryParse(v, out ticks)) s.LastCheck = new DateTime(ticks, DateTimeKind.Utc);
+                    }
+                }
+            }
+            catch { }
+            return s;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                File.WriteAllLines(FilePath, new[]
+                {
+                    "AutoUpdate=" + (AutoUpdate ? "1" : "0"),
+                    "LastCheck=" + LastCheck.Ticks
+                });
+            }
+            catch { }
+        }
+    }
+
+    class UpdateInfo
+    {
+        public Version Version;
+        public string Tag, Notes, Url, Sha256;
+        public long Size;
+    }
+
+    static class Updater
+    {
+        private static string Exe { get { return Application.ExecutablePath; } }
+
+        private static Version Norm(Version v)
+        {
+            return new Version(v.Major, v.Minor, Math.Max(0, v.Build));
+        }
+
+        private static HttpWebRequest Request(string url)
+        {
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "StopProcessing-Updater/" + AppInfo.VersionText;
+            req.Timeout = 20000;
+            req.ReadWriteTimeout = 30000;
+            return req;
+        }
+
+        /// Reads the latest GitHub release. Returns null if there is none.
+        public static UpdateInfo FetchLatest()
+        {
+            var req = Request("https://api.github.com/repos/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/latest");
+            req.Accept = "application/vnd.github+json";
+            string json;
+            try
+            {
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    json = sr.ReadToEnd();
+            }
+            catch (WebException ex)
+            {
+                var r = ex.Response as HttpWebResponse;
+                if (r != null && r.StatusCode == HttpStatusCode.NotFound) return null; // no releases yet
+                throw;
+            }
+
+            var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            string tag = Convert.ToString(d["tag_name"]);
+            Version v;
+            if (!Version.TryParse(tag.TrimStart('v', 'V'), out v)) return null;
+
+            var info = new UpdateInfo
+            {
+                Version = v,
+                Tag = tag,
+                Notes = d.ContainsKey("body") ? Convert.ToString(d["body"]) : ""
+            };
+            var assets = d.ContainsKey("assets") ? d["assets"] as System.Collections.IEnumerable : null;
+            if (assets != null)
+            {
+                foreach (object o in assets)
+                {
+                    var a = o as Dictionary<string, object>;
+                    if (a == null || !string.Equals(Convert.ToString(a["name"]), AppInfo.AssetName, StringComparison.OrdinalIgnoreCase)) continue;
+                    info.Url = Convert.ToString(a["browser_download_url"]);
+                    info.Size = Convert.ToInt64(a["size"]);
+                    string digest = a.ContainsKey("digest") ? Convert.ToString(a["digest"]) : null;
+                    if (!string.IsNullOrEmpty(digest) && digest.StartsWith("sha256:")) info.Sha256 = digest.Substring(7).ToLowerInvariant();
+                }
+            }
+            return info;
+        }
+
+        public static bool IsNewer(UpdateInfo i)
+        {
+            return i != null && !string.IsNullOrEmpty(i.Url) && Norm(i.Version) > Norm(AppInfo.Version);
+        }
+
+        /// Downloads the new exe next to the current one and verifies it.
+        public static string Download(UpdateInfo i, Action<int> percent)
+        {
+            string tmp = Exe + ".download";
+            if (File.Exists(tmp)) File.Delete(tmp);
+
+            var req = Request(i.Url);
+            using (var resp = req.GetResponse())
+            using (var src = resp.GetResponseStream())
+            using (var dst = File.Create(tmp))
+            {
+                long total = resp.ContentLength > 0 ? resp.ContentLength : i.Size;
+                var buf = new byte[81920];
+                long got = 0;
+                int n, last = -1;
+                while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                {
+                    dst.Write(buf, 0, n);
+                    got += n;
+                    if (total > 0)
+                    {
+                        int p = (int)(got * 100 / total);
+                        if (p != last) { last = p; percent(p); }
+                    }
+                }
+            }
+
+            var fi = new FileInfo(tmp);
+            if (i.Size > 0 && fi.Length != i.Size) { File.Delete(tmp); throw new Exception("Download was incomplete."); }
+
+            using (var fs = File.OpenRead(tmp))
+            {
+                if (fs.ReadByte() != 'M' || fs.ReadByte() != 'Z') { fs.Close(); File.Delete(tmp); throw new Exception("Downloaded file is not a valid program."); }
+            }
+
+            if (!string.IsNullOrEmpty(i.Sha256))
+            {
+                string hash;
+                using (var sha = SHA256.Create())
+                using (var fs = File.OpenRead(tmp))
+                    hash = BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+                if (hash != i.Sha256) { File.Delete(tmp); throw new Exception("Checksum did not match — update rejected."); }
+            }
+            return tmp;
+        }
+
+        /// Swaps the running exe for the downloaded one (Windows allows renaming a running exe).
+        public static void Apply(string downloaded)
+        {
+            string old = Exe + ".old";
+            try { if (File.Exists(old)) File.Delete(old); } catch { }
+            if (File.Exists(old)) old = Exe + "." + DateTime.Now.Ticks + ".old";
+            File.Move(Exe, old);
+            try
+            {
+                File.Move(downloaded, Exe);
+            }
+            catch
+            {
+                File.Move(old, Exe); // roll back
+                throw;
+            }
+        }
+
+        public static void CleanupOld()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Exe);
+                string name = Path.GetFileName(Exe);
+                foreach (var f in Directory.GetFiles(dir, name + ".*"))
+                    if (f.EndsWith(".old") || f.EndsWith(".download"))
+                        try { File.Delete(f); } catch { }
+            }
+            catch { }
+        }
+
+        public static void Restart()
+        {
+            Process.Start(new ProcessStartInfo(Exe, "--updated") { UseShellExecute = true });
+        }
+    }
+
     // ------------------------------------------------------------------
     //  Theme
     // ------------------------------------------------------------------
@@ -474,6 +724,9 @@ namespace StopProcessing
 
         public bool Selected { get { return sel; } set { sel = value; Invalidate(); } }
 
+        private bool badge;
+        public bool Badge { get { return badge; } set { badge = value; Invalidate(); } }
+
         protected override void OnMouseEnter(EventArgs e) { hot = true; Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { hot = false; Invalidate(); base.OnMouseLeave(e); }
 
@@ -481,6 +734,11 @@ namespace StopProcessing
         {
             var g = e.Graphics;
             g.Clear(Theme.Surface);
+            if (badge)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var b = new SolidBrush(Theme.Blue)) g.FillEllipse(b, Width - 22, (Height - 8) / 2, 8, 8);
+            }
             g.SmoothingMode = SmoothingMode.AntiAlias;
             if (sel) Theme.FillRound(g, Color.FromArgb(36, 41, 50), new Rectangle(0, 0, Width - 1, Height - 1), 8);
             else if (hot) Theme.FillRound(g, Color.FromArgb(29, 33, 40), new Rectangle(0, 0, Width - 1, Height - 1), 8);
@@ -794,7 +1052,7 @@ namespace StopProcessing
         {
             isAdmin = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
 
-            Text = "Stop Processing";
+            Text = "Vibe Stop Processing";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(1200, 760);
@@ -814,10 +1072,27 @@ namespace StopProcessing
             pages.Add(BuildProcessesPage());
             pages.Add(BuildCleanerPage());
             pages.Add(BuildPowerPage());
+            pages.Add(BuildSettingsPage());
             foreach (var p in pages) contentHost.Controls.Add(p);
 
             ShowPage(0);
             StartTimer();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            Updater.CleanupOld();
+            if (Environment.GetCommandLineArgs().Any(a => a == "--updated"))
+            {
+                ThemedDialog.Show(this, "Update installed",
+                    "Stop Processing was updated to version " + AppInfo.VersionText + ".", new[] { "OK" }, 0, Theme.Green);
+            }
+
+            // check for updates a few seconds after start so the UI is responsive first
+            var t = new System.Windows.Forms.Timer { Interval = 4000 };
+            t.Tick += (s, ev) => { t.Stop(); t.Dispose(); CheckForUpdates(false); };
+            t.Start();
         }
 
         protected override CreateParams CreateParams
@@ -868,7 +1143,8 @@ namespace StopProcessing
             {
                 new[] { "", "Processes" },
                 new[] { "", "Cleaner" },
-                new[] { "", "Power Fix" }
+                new[] { "", "Power Fix" },
+                new[] { "", "Settings" }
             };
             for (int i = 0; i < items.Length; i++)
             {
@@ -2217,6 +2493,268 @@ namespace StopProcessing
         }
 
         // =================================================================
+        //  PAGE 4: Settings (updates + about)
+        // =================================================================
+
+        private readonly AppSettings settings = AppSettings.Load();
+        private UpdateInfo pendingUpdate;
+        private volatile bool isUpdating;
+        private bool updateInstalled;
+        private Label updStatus, updLastCheck;
+        private CheckToggle autoUpdateToggle;
+        private FlatButton checkUpdateButton, installUpdateButton;
+        private SlimBar updProgress;
+        private TextBox updNotes;
+
+        private Control BuildSettingsPage()
+        {
+            var page = NewPage();
+            var layout = Table(1, 2, Theme.Bg);
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            var header = new PageHeader("Settings", "Updates and information about this app.") { Dock = DockStyle.Fill };
+
+            var body = Table(2, 1, Theme.Bg);
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330F));
+
+            // ---- updates card
+            var card = new Card { Dock = DockStyle.Fill, Padding = new Padding(22, 18, 22, 18), Margin = new Padding(0, 0, 14, 0) };
+            var t = Table(1, 10, Theme.Card);
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));  // title
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 22F));  // installed version
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));  // status
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 22F));  // last check
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));  // toggle
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));  // hint
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 62F));  // buttons
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 18F));  // progress
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));  // notes caption
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));  // notes
+
+            updStatus = MakeLabel("Not checked yet", Theme.F(13f, FontStyle.Bold), Theme.Text);
+            updLastCheck = MakeLabel(LastCheckText(), Theme.F(8.5f), Theme.Faint, ContentAlignment.TopLeft);
+
+            autoUpdateToggle = new CheckToggle { Text = "Install updates automatically", Dock = DockStyle.Fill, Checked = settings.AutoUpdate };
+            autoUpdateToggle.CheckedChanged += (s, e) => { settings.AutoUpdate = autoUpdateToggle.Checked; settings.Save(); };
+
+            var hint = MakeLabel("When this is off, the app tells you about new versions and you install them here.",
+                Theme.F(8.5f), Theme.Muted, ContentAlignment.TopLeft);
+
+            var btnRow = Table(2, 1, Theme.Card);
+            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            checkUpdateButton = new FlatButton { Text = "Check for Updates", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 8, 6, 8), Font = Theme.Semi(9.5f) };
+            checkUpdateButton.SetColor(Theme.Secondary);
+            checkUpdateButton.Click += (s, e) => CheckForUpdates(true);
+            installUpdateButton = new FlatButton { Text = "Install Update", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(6, 8, 0, 8), Font = Theme.Semi(9.5f), Enabled = false };
+            installUpdateButton.SetColor(Theme.Blue);
+            installUpdateButton.Click += (s, e) => InstallUpdate(false);
+            btnRow.Controls.Add(checkUpdateButton, 0, 0);
+            btnRow.Controls.Add(installUpdateButton, 1, 0);
+
+            updProgress = new SlimBar { Dock = DockStyle.Fill };
+
+            updNotes = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                BorderStyle = BorderStyle.None,
+                BackColor = Theme.Inset,
+                ForeColor = Theme.Soft,
+                Font = Theme.F(9f),
+                ScrollBars = ScrollBars.Vertical,
+                Text = "Release notes appear here when an update is found.",
+                Margin = new Padding(0, 6, 0, 0)
+            };
+            updNotes.HandleCreated += (s, e) => Native.DarkScroll(updNotes);
+
+            t.Controls.Add(MakeLabel("Updates", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
+            t.Controls.Add(MakeLabel("Installed version  " + AppInfo.VersionText, Theme.F(9f), Theme.Muted), 0, 1);
+            t.Controls.Add(updStatus, 0, 2);
+            t.Controls.Add(updLastCheck, 0, 3);
+            t.Controls.Add(autoUpdateToggle, 0, 4);
+            t.Controls.Add(hint, 0, 5);
+            t.Controls.Add(btnRow, 0, 6);
+            t.Controls.Add(updProgress, 0, 7);
+            t.Controls.Add(Caption("RELEASE NOTES"), 0, 8);
+            t.Controls.Add(updNotes, 0, 9);
+            card.Controls.Add(t);
+
+            // ---- about card
+            var about = new Card { Dock = DockStyle.Fill, Padding = new Padding(20, 18, 20, 18) };
+            var a = Table(1, 7, Theme.Card);
+            a.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            a.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            a.RowStyles.Add(new RowStyle(SizeType.Absolute, 70F));
+            a.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+            a.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            a.RowStyles.Add(new RowStyle(SizeType.Absolute, 80F));
+            a.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            var desc = MakeLabel("Closes apps before shutdown, cleans temporary files and stops your PC from turning itself back on.",
+                Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
+            desc.AutoEllipsis = false;
+            var site = new FlatButton { Text = "Website & Downloads", Glyph = "", Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 6), Font = Theme.Semi(9.5f) };
+            site.SetColor(Theme.Secondary);
+            site.Click += (s, e) => { try { Process.Start(AppInfo.RepoUrl); } catch { } };
+            var lic = MakeLabel("© 2026 Vibe. All rights reserved.\nLicensed for personal use only. Modifying, " +
+                "reverse-engineering or redistributing this software is not allowed.", Theme.F(8.5f), Theme.Faint, ContentAlignment.TopLeft);
+            lic.AutoEllipsis = false;
+
+            a.Controls.Add(MakeLabel("Vibe Stop Processing", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
+            a.Controls.Add(MakeLabel("Version " + AppInfo.VersionText, Theme.F(9f), Theme.Blue), 0, 1);
+            a.Controls.Add(desc, 0, 2);
+            a.Controls.Add(site, 0, 3);
+            a.Controls.Add(Caption("LICENSE"), 0, 4);
+            a.Controls.Add(lic, 0, 5);
+            about.Controls.Add(a);
+
+            body.Controls.Add(card, 0, 0);
+            body.Controls.Add(about, 1, 0);
+            layout.Controls.Add(header, 0, 0);
+            layout.Controls.Add(body, 0, 1);
+            page.Controls.Add(layout);
+            return page;
+        }
+
+        private string LastCheckText()
+        {
+            if (settings.LastCheck == DateTime.MinValue) return "Never checked";
+            return "Last checked " + settings.LastCheck.ToLocalTime().ToString("d MMM yyyy, h:mm tt");
+        }
+
+        private void SetUpdateStatus(string text, Color color)
+        {
+            updStatus.Text = text;
+            updStatus.ForeColor = color;
+        }
+
+        private void CheckForUpdates(bool userInitiated)
+        {
+            if (isUpdating || updateInstalled) return;
+            isUpdating = true;
+            checkUpdateButton.Enabled = false;
+            SetUpdateStatus("Checking for updates…", Theme.Muted);
+
+            var th = new Thread(() =>
+            {
+                UpdateInfo info = null;
+                string error = null;
+                try { info = Updater.FetchLatest(); }
+                catch (Exception ex) { error = ex.Message; }
+
+                Ui(() =>
+                {
+                    isUpdating = false;
+                    checkUpdateButton.Enabled = true;
+                    settings.LastCheck = DateTime.UtcNow;
+                    settings.Save();
+                    updLastCheck.Text = LastCheckText();
+
+                    if (error != null)
+                    {
+                        SetUpdateStatus("Couldn't check for updates", Theme.Amber);
+                        updNotes.Text = "Check your internet connection and try again.\r\n\r\n" + error;
+                        if (userInitiated)
+                            ThemedDialog.Show(this, "Update check failed", "Couldn't reach the update server.\n\n" + error, new[] { "OK" }, 0, Theme.Amber);
+                        return;
+                    }
+
+                    if (!Updater.IsNewer(info))
+                    {
+                        pendingUpdate = null;
+                        installUpdateButton.Enabled = false;
+                        navItems[3].Badge = false;
+                        SetUpdateStatus("You're up to date", Theme.Green);
+                        updNotes.Text = info != null && !string.IsNullOrEmpty(info.Notes)
+                            ? "What's in " + info.Tag + ":\r\n\r\n" + info.Notes.Replace("\r\n", "\n").Replace("\n", "\r\n")
+                            : "You have the latest version.";
+                        return;
+                    }
+
+                    pendingUpdate = info;
+                    installUpdateButton.Enabled = true;
+                    navItems[3].Badge = true;
+                    SetUpdateStatus("Version " + info.Tag.TrimStart('v', 'V') + " is available", Theme.Blue);
+                    updNotes.Text = string.IsNullOrEmpty(info.Notes)
+                        ? "No release notes."
+                        : info.Notes.Replace("\r\n", "\n").Replace("\n", "\r\n");
+
+                    if (!userInitiated && settings.AutoUpdate)
+                    {
+                        InstallUpdate(true);
+                    }
+                    else
+                    {
+                        int ans = ThemedDialog.Show(this, "Update available",
+                            "Stop Processing " + info.Tag.TrimStart('v', 'V') + " is available. You have " + AppInfo.VersionText + ".",
+                            new[] { "Install now", "Later" }, 0, Theme.Blue);
+                        if (ans == 0) InstallUpdate(false);
+                    }
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void InstallUpdate(bool automatic)
+        {
+            var info = pendingUpdate;
+            if (info == null || isUpdating || updateInstalled) return;
+            isUpdating = true;
+            checkUpdateButton.Enabled = false;
+            installUpdateButton.Enabled = false;
+            updProgress.Maximum = 100;
+            updProgress.Value = 0;
+            SetUpdateStatus("Downloading " + info.Tag + "…", Theme.Blue);
+
+            var th = new Thread(() =>
+            {
+                string error = null;
+                try
+                {
+                    string file = Updater.Download(info, p => Ui(() => updProgress.Value = p));
+                    Updater.Apply(file);
+                }
+                catch (Exception ex) { error = ex.Message; }
+
+                Ui(() =>
+                {
+                    isUpdating = false;
+                    checkUpdateButton.Enabled = true;
+                    if (error != null)
+                    {
+                        installUpdateButton.Enabled = true;
+                        SetUpdateStatus("Update failed", Theme.Red);
+                        updNotes.Text = error;
+                        if (!automatic)
+                            ThemedDialog.Show(this, "Update failed", error, new[] { "OK" }, 0, Theme.Red);
+                        return;
+                    }
+
+                    updateInstalled = true;
+                    navItems[3].Badge = false;
+                    updProgress.Value = 100;
+                    SetUpdateStatus("Update installed — restart to finish", Theme.Green);
+
+                    if (isStopping || isCleaning) return; // don't interrupt a running job
+                    int ans = ThemedDialog.Show(this, "Update ready",
+                        "Stop Processing " + info.Tag.TrimStart('v', 'V') + " has been installed. Restart the app now to use it?",
+                        new[] { "Restart now", "Later" }, 0, Theme.Green);
+                    if (ans == 0)
+                    {
+                        try { Updater.Restart(); Close(); } catch { }
+                    }
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        // =================================================================
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -2283,11 +2821,15 @@ namespace StopProcessing
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             var tf = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
+            var bf = Theme.F(9.5f, FontStyle.Bold);
+            int bw = TextRenderer.MeasureText(g, "VIBE", bf, Size.Empty, tf).Width;
+            TextRenderer.DrawText(g, "VIBE", bf, new Rectangle(46, 0, bw + 4, Height), Color.FromArgb(240, 92, 70), tf);
             string name = "Stop Processing";
             var nf = Theme.Semi(9.5f);
+            int nx = 46 + bw + 6;
             int nw = TextRenderer.MeasureText(g, name, nf, Size.Empty, tf).Width;
-            TextRenderer.DrawText(g, name, nf, new Rectangle(46, 0, nw + 4, Height), Theme.Text, tf);
-            TextRenderer.DrawText(g, "PC Shutdown Assistant", Theme.F(9f), new Rectangle(46 + nw + 10, 0, 220, Height), Theme.Faint, tf);
+            TextRenderer.DrawText(g, name, nf, new Rectangle(nx, 0, nw + 4, Height), Theme.Text, tf);
+            TextRenderer.DrawText(g, "PC Shutdown Assistant", Theme.F(9f), new Rectangle(nx + nw + 10, 0, 220, Height), Theme.Faint, tf);
 
             using (var pen = new Pen(Color.FromArgb(30, 34, 40)))
                 g.DrawLine(pen, 0, Height - 1, Width, Height - 1);
@@ -2332,7 +2874,7 @@ namespace StopProcessing
             TextRenderer.DrawText(g,
                 admin ? "Running as administrator" : "Limited mode — run as administrator for Power Fix and full cleaning",
                 Theme.F(8.5f), new Rectangle(28, 0, Width - 200, Height), Theme.Muted, tf);
-            TextRenderer.DrawText(g, "Stop Processing 2.0", Theme.F(8.5f), new Rectangle(0, 0, Width - 14, Height), Theme.Faint,
+            TextRenderer.DrawText(g, "Vibe Stop Processing " + AppInfo.VersionText, Theme.F(8.5f), new Rectangle(0, 0, Width - 14, Height), Theme.Faint,
                 tf | TextFormatFlags.Right);
         }
     }
