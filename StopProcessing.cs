@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Vibe")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
-[assembly: AssemblyVersion("2.3.0.0")]
-[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyVersion("2.4.0.0")]
+[assembly: AssemblyFileVersion("2.4.0.0")]
 
 namespace StopProcessing
 {
@@ -65,6 +65,9 @@ namespace StopProcessing
     class AppSettings
     {
         public bool AutoUpdate = true;
+        public bool StartWithWindows = true;
+        public bool CloseToTray = true;
+        public bool TrayHintShown = false;
         public DateTime LastCheck = DateTime.MinValue;
 
         private static string FilePath { get { return Path.Combine(AppInfo.DataDir, "settings.ini"); } }
@@ -81,6 +84,9 @@ namespace StopProcessing
                     if (i <= 0) continue;
                     string k = line.Substring(0, i).Trim(), v = line.Substring(i + 1).Trim();
                     if (k == "AutoUpdate") s.AutoUpdate = v != "0";
+                    else if (k == "StartWithWindows") s.StartWithWindows = v != "0";
+                    else if (k == "CloseToTray") s.CloseToTray = v != "0";
+                    else if (k == "TrayHintShown") s.TrayHintShown = v != "0";
                     else if (k == "LastCheck")
                     {
                         long ticks;
@@ -99,6 +105,9 @@ namespace StopProcessing
                 File.WriteAllLines(FilePath, new[]
                 {
                     "AutoUpdate=" + (AutoUpdate ? "1" : "0"),
+                    "StartWithWindows=" + (StartWithWindows ? "1" : "0"),
+                    "CloseToTray=" + (CloseToTray ? "1" : "0"),
+                    "TrayHintShown=" + (TrayHintShown ? "1" : "0"),
                     "LastCheck=" + LastCheck.Ticks
                 });
             }
@@ -314,9 +323,100 @@ namespace StopProcessing
             catch { }
         }
 
-        public static void Restart()
+        public static void Restart(bool toTray)
         {
-            Process.Start(new ProcessStartInfo(Exe, "--updated") { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo(Exe, toTray ? "--updated --tray" : "--updated") { UseShellExecute = true });
+        }
+    }
+
+    /// Starts the app in the tray at sign-in. A scheduled task is used because the app needs
+    /// admin rights, and Windows skips elevated programs in the normal Startup/Run list.
+    static class StartupTask
+    {
+        private static string TaskName
+        {
+            get { return "VibeStopProcessing_" + Environment.UserName; }
+        }
+
+        public static bool Exists()
+        {
+            int code;
+            Native.Run("schtasks.exe", "/query /tn \"" + TaskName + "\"", out code);
+            return code == 0;
+        }
+
+        public static string Enable()
+        {
+            string user = WindowsIdentity.GetCurrent().Name;
+            string exe = Application.ExecutablePath;
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+                "  <RegistrationInfo><Author>Vibe</Author><Description>Starts Vibe Stop Processing in the system tray when you sign in.</Description></RegistrationInfo>\r\n" +
+                "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + Esc(user) + "</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>\r\n" +
+                "  <Principals><Principal id=\"Author\"><UserId>" + Esc(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n" +
+                "  <Settings>\r\n" +
+                "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+                "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+                "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+                "    <AllowHardTerminate>true</AllowHardTerminate>\r\n" +
+                "    <StartWhenAvailable>false</StartWhenAvailable>\r\n" +
+                "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n" +
+                "    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\r\n" +
+                "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n" +
+                "    <Enabled>true</Enabled>\r\n" +
+                "    <Hidden>false</Hidden>\r\n" +
+                "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n" +
+                "    <WakeToRun>false</WakeToRun>\r\n" +
+                "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
+                "    <Priority>7</Priority>\r\n" +
+                "  </Settings>\r\n" +
+                "  <Actions Context=\"Author\"><Exec><Command>" + Esc(exe) + "</Command><Arguments>--tray</Arguments></Exec></Actions>\r\n" +
+                "</Task>\r\n";
+
+            string file = Path.Combine(Path.GetTempPath(), "VibeStopProcessing_task.xml");
+            File.WriteAllText(file, xml, System.Text.Encoding.Unicode);
+            int code;
+            string output = Native.Run("schtasks.exe", "/create /tn \"" + TaskName + "\" /xml \"" + file + "\" /f", out code);
+            try { File.Delete(file); } catch { }
+            return code == 0 ? null : output.Trim();
+        }
+
+        public static void Disable()
+        {
+            int code;
+            Native.Run("schtasks.exe", "/delete /tn \"" + TaskName + "\" /f", out code);
+        }
+
+        private static string Esc(string s)
+        {
+            return System.Security.SecurityElement.Escape(s);
+        }
+    }
+
+    class DarkMenuColors : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground { get { return Theme.Surface; } }
+        public override Color ImageMarginGradientBegin { get { return Theme.Surface; } }
+        public override Color ImageMarginGradientMiddle { get { return Theme.Surface; } }
+        public override Color ImageMarginGradientEnd { get { return Theme.Surface; } }
+        public override Color MenuBorder { get { return Theme.Line; } }
+        public override Color MenuItemBorder { get { return Theme.CardHi; } }
+        public override Color MenuItemSelected { get { return Theme.CardHi; } }
+        public override Color MenuItemSelectedGradientBegin { get { return Theme.CardHi; } }
+        public override Color MenuItemSelectedGradientEnd { get { return Theme.CardHi; } }
+        public override Color SeparatorDark { get { return Theme.Line; } }
+        public override Color SeparatorLight { get { return Theme.Line; } }
+    }
+
+    class DarkMenuRenderer : ToolStripProfessionalRenderer
+    {
+        public DarkMenuRenderer() : base(new DarkMenuColors()) { RoundedEdges = false; }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = !e.Item.Enabled ? Theme.Faint : e.Item.ForeColor == Theme.Red ? Theme.Red : Theme.Text;
+            base.OnRenderItemText(e);
         }
     }
 
@@ -433,6 +533,12 @@ namespace StopProcessing
 
         [DllImport("user32.dll")]
         public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int RegisterWindowMessage(string name);
+
+        [DllImport("user32.dll")]
+        public static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
         public static extern int SetWindowTheme(IntPtr hWnd, string appName, string idList);
@@ -884,6 +990,147 @@ namespace StopProcessing
         }
     }
 
+    /// A list row with an on/off switch (used for startup apps).
+    class ToggleRow : Control
+    {
+        public string Desc, Source;
+        private bool on, hot;
+        public event EventHandler Toggled;
+
+        public ToggleRow(string title, string desc, string source, bool isOn)
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Text = title;
+            Desc = desc;
+            Source = source;
+            on = isOn;
+            Height = 54;
+            Dock = DockStyle.Top;
+            Cursor = Cursors.Hand;
+        }
+
+        public bool On { get { return on; } set { on = value; Invalidate(); } }
+
+        protected override void OnClick(EventArgs e)
+        {
+            base.OnClick(e);
+            if (Enabled && Toggled != null) Toggled(this, EventArgs.Empty);
+        }
+        protected override void OnMouseEnter(EventArgs e) { hot = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hot = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Theme.Card);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (hot) Theme.FillRound(g, Theme.CardHi, new Rectangle(0, 2, Width - 1, Height - 5), 10);
+
+            var tile = new Rectangle(12, (Height - 34) / 2, 34, 34);
+            Theme.FillRound(g, on ? Color.FromArgb(38, 48, 66) : Color.FromArgb(40, 43, 50), tile, 9);
+            TextRenderer.DrawText(g, "\uE71D", Theme.Icon(11f), tile, on ? Theme.Blue : Theme.Faint,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+
+            // switch
+            var sw = new Rectangle(Width - 14 - 40, (Height - 22) / 2, 40, 22);
+            Theme.FillRound(g, on ? Theme.Blue : Theme.Secondary, sw, 11);
+            int kx = on ? sw.Right - 19 : sw.X + 3;
+            using (var b = new SolidBrush(on ? Color.White : Theme.Muted))
+                g.FillEllipse(b, kx, sw.Y + 3, 16, 16);
+
+            var tf = TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+            int srcW = TextRenderer.MeasureText(g, Source, Theme.F(8f), Size.Empty, tf).Width;
+            int textW = sw.X - 58 - srcW - 24;
+            TextRenderer.DrawText(g, Text, Theme.Semi(10f), new Rectangle(58, 8, textW, 20), on ? Theme.Text : Theme.Muted, tf);
+            TextRenderer.DrawText(g, Desc, Theme.F(8.5f), new Rectangle(58, 29, textW, 18), Theme.Faint, tf);
+            TextRenderer.DrawText(g, Source, Theme.F(8f), new Rectangle(sw.X - srcW - 14, 0, srcW + 2, Height), Theme.Faint,
+                tf | TextFormatFlags.VerticalCenter);
+        }
+    }
+
+    /// A clickable card for one tool.
+    class ToolTile : Control
+    {
+        public string Glyph, Desc;
+        private readonly Action run;
+        private bool hot;
+
+        public ToolTile(string glyph, string title, string desc, Action run)
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Glyph = glyph;
+            Text = title;
+            Desc = desc;
+            this.run = run;
+            Cursor = Cursors.Hand;
+        }
+
+        protected override void OnClick(EventArgs e) { base.OnClick(e); if (run != null) run(); }
+        protected override void OnMouseEnter(EventArgs e) { hot = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hot = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Theme.FillRound(g, hot ? Theme.CardHi : Theme.Card, new Rectangle(0, 0, Width - 1, Height - 1), 12);
+
+            var tile = new Rectangle(20, 20, 44, 44);
+            Theme.FillRound(g, Color.FromArgb(38, 48, 66), tile, 11);
+            TextRenderer.DrawText(g, Glyph, Theme.Icon(15f), tile, Theme.Blue,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+
+            var tf = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix;
+            TextRenderer.DrawText(g, Text, Theme.F(11.5f, FontStyle.Bold), new Rectangle(78, 22, Width - 96, 24), Theme.Text, tf | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(g, Desc, Theme.F(9f), new Rectangle(78, 48, Width - 96, Height - 60), Theme.Muted, tf | TextFormatFlags.WordBreak);
+
+            TextRenderer.DrawText(g, "\uE76C", Theme.Icon(10f), new Rectangle(Width - 34, 26, 16, 16), hot ? Theme.Text : Theme.Faint, tf);
+        }
+    }
+
+    /// Free space bars for every fixed drive.
+    class DriveList : Control
+    {
+        public DriveList()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Theme.Card);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            int y = 4;
+            foreach (var d in DriveInfo.GetDrives())
+            {
+                long total, free;
+                try
+                {
+                    if (d.DriveType != DriveType.Fixed || !d.IsReady) continue;
+                    total = d.TotalSize;
+                    free = d.TotalFreeSpace;
+                }
+                catch { continue; }
+                if (y + 40 > Height) break;
+                double used = total > 0 ? 1.0 - free / (double)total : 0;
+                Color c = used > 0.9 ? Theme.Red : used > 0.75 ? Theme.Amber : Theme.Blue;
+                var tf = TextFormatFlags.NoPadding;
+                TextRenderer.DrawText(g, d.Name.TrimEnd('\\'), Theme.Semi(9.5f), new Point(0, y), Theme.Text, tf);
+                string info = Theme.FormatBytes(free) + " free of " + Theme.FormatBytes(total);
+                TextRenderer.DrawText(g, info, Theme.F(8.5f), new Rectangle(0, y, Width, 18), Theme.Muted, tf | TextFormatFlags.Right);
+                Theme.FillRound(g, Theme.Inset, new Rectangle(0, y + 22, Width - 1, 6), 3);
+                int w = (int)((Width - 1) * used);
+                if (w > 6) Theme.FillRound(g, c, new Rectangle(0, y + 22, w, 6), 3);
+                y += 40;
+            }
+        }
+    }
+
     enum CheckState2 { Unknown, Ok, Risk }
 
     /// One power / wake cause with its current state.
@@ -1126,30 +1373,131 @@ namespace StopProcessing
             pages.Add(BuildProcessesPage());
             pages.Add(BuildCleanerPage());
             pages.Add(BuildPowerPage());
+            pages.Add(BuildToolsPage());
             pages.Add(BuildSettingsPage());
             foreach (var p in pages) contentHost.Controls.Add(p);
 
             int startPage = 0;
-            foreach (var arg in Environment.GetCommandLineArgs())
+            var args = Environment.GetCommandLineArgs();
+            foreach (var arg in args)
                 if (arg.StartsWith("--page=")) int.TryParse(arg.Substring(7), out startPage);
             ShowPage(Math.Max(0, Math.Min(pages.Count - 1, startPage)));
+            startInTray = args.Contains("--tray");
+            justUpdated = args.Contains("--updated");
+
+            BuildTray();
             StartTimer();
+
+            // background start-up work runs from here (OnShown does not fire while hidden in the tray)
+            var t = new System.Windows.Forms.Timer { Interval = 4000 };
+            t.Tick += (s, ev) => { t.Stop(); t.Dispose(); CheckForUpdates(false); };
+            t.Start();
+            Updater.CleanupOld();
+            SyncStartupTask();
+        }
+
+        // ---------------- tray ----------------
+
+        public static readonly int WM_SHOWME = Native.RegisterWindowMessage("VibeStopProcessing_ShowWindow");
+        private NotifyIcon tray;
+        private bool startInTray, justUpdated, allowVisible, reallyExit;
+
+        private void BuildTray()
+        {
+            var menu = new ContextMenuStrip
+            {
+                Renderer = new DarkMenuRenderer(),
+                Font = Theme.F(9.5f),
+                ShowImageMargin = false,
+                BackColor = Theme.Surface,
+                ForeColor = Theme.Text,
+                Padding = new Padding(2, 4, 2, 4)
+            };
+            Func<string, EventHandler, ToolStripMenuItem> item = (text, onClick) =>
+            {
+                var mi = new ToolStripMenuItem(text, null, onClick) { Padding = new Padding(8, 5, 8, 5), ForeColor = Theme.Text };
+                menu.Items.Add(mi);
+                return mi;
+            };
+            var open = item("Open Vibe Stop Processing", (s, e) => ShowFromTray(-1));
+            open.Font = Theme.F(9.5f, FontStyle.Bold);
+            menu.Items.Add(new ToolStripSeparator());
+            item("Processes", (s, e) => ShowFromTray(0));
+            item("Cleaner", (s, e) => ShowFromTray(1));
+            item("Power Fix", (s, e) => ShowFromTray(2));
+            item("Tools", (s, e) => ShowFromTray(3));
+            item("Settings", (s, e) => ShowFromTray(SettingsPage));
+            menu.Items.Add(new ToolStripSeparator());
+            var shut = item("Shut Down PC", (s, e) => { ShowFromTray(-1); FullShutdown(); });
+            shut.ForeColor = Theme.Red;
+            menu.Items.Add(new ToolStripSeparator());
+            item("Exit", (s, e) => ExitApp());
+
+            tray = new NotifyIcon
+            {
+                Icon = Icon ?? SystemIcons.Application,
+                Text = "Vibe Stop Processing",
+                ContextMenuStrip = menu,
+                Visible = true
+            };
+            tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) ShowFromTray(-1); };
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            if (!allowVisible)
+            {
+                allowVisible = true;
+                if (startInTray)
+                {
+                    if (!IsHandleCreated) CreateHandle();
+                    value = false;
+                    if (justUpdated)
+                        tray.ShowBalloonTip(4000, "Vibe Stop Processing updated",
+                            "Now running version " + AppInfo.VersionText + ".", ToolTipIcon.Info);
+                }
+            }
+            base.SetVisibleCore(value);
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            Updater.CleanupOld();
-            if (Environment.GetCommandLineArgs().Any(a => a == "--updated"))
-            {
+            if (justUpdated)
                 ThemedDialog.Show(this, "Update installed",
-                    "Stop Processing was updated to version " + AppInfo.VersionText + ".", new[] { "OK" }, 0, Theme.Green);
-            }
+                    "Vibe Stop Processing was updated to version " + AppInfo.VersionText + ".", new[] { "OK" }, 0, Theme.Green);
+        }
 
-            // check for updates a few seconds after start so the UI is responsive first
-            var t = new System.Windows.Forms.Timer { Interval = 4000 };
-            t.Tick += (s, ev) => { t.Stop(); t.Dispose(); CheckForUpdates(false); };
-            t.Start();
+        public void ShowFromTray(int page)
+        {
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            if (page >= 0) ShowPage(page);
+            Activate();
+            BringToFront();
+            if (currentPage == 0) RefreshGrid();
+        }
+
+        private void ExitApp()
+        {
+            reallyExit = true;
+            if (!Visible && (isStopping || isCleaning)) ShowFromTray(-1);
+            Close();
+            reallyExit = false; // only reached if closing was cancelled
+        }
+
+        private void SyncStartupTask()
+        {
+            if (!isAdmin) return;
+            bool want = settings.StartWithWindows;
+            var th = new Thread(() =>
+            {
+                // re-registering on every start keeps the task pointing at the current exe location
+                if (want) StartupTask.Enable();
+                else if (StartupTask.Exists()) StartupTask.Disable();
+            });
+            th.IsBackground = true;
+            th.Start();
         }
 
         protected override CreateParams CreateParams
@@ -1165,6 +1513,11 @@ namespace StopProcessing
 
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == WM_SHOWME && WM_SHOWME != 0)
+            {
+                ShowFromTray(-1);
+                return;
+            }
             if (m.Msg == 0x84 && WindowState == FormWindowState.Normal)
             {
                 base.WndProc(ref m);
@@ -1188,6 +1541,7 @@ namespace StopProcessing
         // ---------------- shell ----------------
 
         private EdgePanel contentHost;
+        private const int SettingsPage = 4;
 
         private void BuildShell()
         {
@@ -1201,6 +1555,7 @@ namespace StopProcessing
                 new[] { "\uE9D9", "Processes" },
                 new[] { "\uE74D", "Cleaner" },
                 new[] { "\uE7E8", "Power Fix" },
+                new[] { "\uE90F", "Tools" },
                 new[] { "\uE713", "Settings" }
             };
             for (int i = 0; i < items.Length; i++)
@@ -1284,6 +1639,7 @@ namespace StopProcessing
 
             if (idx == 1 && !scannedOnce) { scannedOnce = true; StartScan(); }
             if (idx == 2 && !powerCheckedOnce) { powerCheckedOnce = true; CheckPowerAsync(); }
+            if (idx == 3) RefreshPcInfo();
         }
 
         private EdgePanel NewPage()
@@ -1828,12 +2184,65 @@ namespace StopProcessing
                 Desc = "Old crash dumps and Windows Error Reporting files",
                 Dirs = new[] { Path.Combine(local, "CrashDumps"), Path.Combine(pd, @"Microsoft\Windows\WER\ReportArchive"),
                                Path.Combine(pd, @"Microsoft\Windows\WER\ReportQueue") } });
+            cleanTargets.Add(new CleanTarget { Name = "Browser cache", Glyph = "\uE774", DefaultOn = true,
+                Desc = "Chrome, Edge, Brave, Opera, Firefox \u2014 logins and history are kept",
+                Dirs = BrowserCacheDirs(local, Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)) });
             cleanTargets.Add(new CleanTarget { Name = "Windows Update cache", Glyph = "\uE896", DefaultOn = false,
                 Desc = "Update files that were already downloaded", Dirs = new[] { Path.Combine(win, @"SoftwareDistribution\Download") } });
             cleanTargets.Add(new CleanTarget { Name = "Prefetch data", Glyph = "\uE945", DefaultOn = false,
                 Desc = "Launch cache \u2014 apps may open a bit slower once", Dirs = new[] { Path.Combine(win, "Prefetch") } });
             cleanTargets.Add(new CleanTarget { Name = "Recycle Bin", Glyph = "\uE74D", DefaultOn = false, Recycle = true,
                 Desc = "Permanently empties the Recycle Bin", Dirs = new string[0] });
+        }
+
+        /// Only cache folders - never cookies, history, passwords or bookmarks.
+        private static string[] BrowserCacheDirs(string local, string roaming)
+        {
+            var dirs = new List<string>();
+            string[] chromium =
+            {
+                Path.Combine(local, @"Google\Chrome\User Data"),
+                Path.Combine(local, @"Microsoft\Edge\User Data"),
+                Path.Combine(local, @"BraveSoftware\Brave-Browser\User Data"),
+                Path.Combine(local, @"Vivaldi\User Data"),
+                Path.Combine(roaming, @"Opera Software\Opera Stable"),
+                Path.Combine(local, @"Opera Software\Opera Stable"),
+                Path.Combine(roaming, @"Opera Software\Opera GX Stable"),
+                Path.Combine(local, @"Opera Software\Opera GX Stable")
+            };
+            string[] cacheNames = { "Cache", "Code Cache", "GPUCache" };
+            foreach (var root in chromium)
+            {
+                if (!Directory.Exists(root)) continue;
+                var profiles = new List<string> { root };
+                try
+                {
+                    profiles.AddRange(Directory.GetDirectories(root).Where(d =>
+                    {
+                        string n = Path.GetFileName(d);
+                        return n == "Default" || n.StartsWith("Profile ") || n == "Guest Profile";
+                    }));
+                }
+                catch { }
+                foreach (var p in profiles)
+                    foreach (var c in cacheNames)
+                    {
+                        string d = Path.Combine(p, c);
+                        if (Directory.Exists(d)) dirs.Add(d);
+                    }
+            }
+            try
+            {
+                string ff = Path.Combine(local, @"Mozilla\Firefox\Profiles");
+                if (Directory.Exists(ff))
+                    foreach (var p in Directory.GetDirectories(ff))
+                    {
+                        string d = Path.Combine(p, "cache2");
+                        if (Directory.Exists(d)) dirs.Add(d);
+                    }
+            }
+            catch { }
+            return dirs.ToArray();
         }
 
         private Control BuildCleanerPage()
@@ -2564,6 +2973,335 @@ namespace StopProcessing
         private SlimBar updProgress;
         private TextBox updNotes;
 
+        // =================================================================
+        //  PAGE 4: Tools (one-click fixes every user needs sooner or later)
+        // =================================================================
+
+        private PageHeader toolsHeader;
+        private ListBox toolsLog;
+        private Label pcInfo;
+        private DriveList drives;
+        private volatile bool toolBusy;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private class MEMORYSTATUSEX
+        {
+            public uint dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX buffer);
+
+        [DllImport("psapi.dll")]
+        private static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        [DllImport("kernel32.dll")]
+        private static extern ulong GetTickCount64();
+
+        private static MEMORYSTATUSEX Memory()
+        {
+            var m = new MEMORYSTATUSEX();
+            GlobalMemoryStatusEx(m);
+            return m;
+        }
+
+        private Control BuildToolsPage()
+        {
+            var page = NewPage();
+            var layout = Table(1, 2, Theme.Bg);
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            toolsHeader = new PageHeader("Tools", "One-click fixes for the most common PC problems.") { Dock = DockStyle.Fill };
+
+            var body = Table(2, 1, Theme.Bg);
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330F));
+
+            // ---- tool tiles (2 x 3)
+            var grid2 = Table(2, 3, Theme.Bg);
+            grid2.Margin = new Padding(0, 0, 14, 0);
+            grid2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            grid2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            for (int i = 0; i < 3; i++) grid2.RowStyles.Add(new RowStyle(SizeType.Percent, 33.3F));
+
+            var tiles = new[]
+            {
+                new ToolTile("\uE945", "Free Up RAM", "Release memory that apps are holding but not using.", FreeRam),
+                new ToolTile("\uE90F", "Repair Windows", "Find and fix damaged Windows system files (DISM + SFC).", RepairWindows),
+                new ToolTile("\uE774", "Fix Internet", "Reset DNS, Winsock and IP when the internet stops working.", FixInternet),
+                new ToolTile("\uE72C", "Restart Explorer", "Fixes a frozen taskbar, Start menu or desktop.", () => RunTool("Restart Explorer", RestartExplorer)),
+                new ToolTile("\uEDA2", "Disk Health", "Check whether your hard drive or SSD is healthy.", DiskHealth),
+                new ToolTile("\uE83F", "Battery Report", "See your laptop battery's real capacity and wear.", BatteryReport)
+            };
+            for (int i = 0; i < tiles.Length; i++)
+            {
+                tiles[i].Dock = DockStyle.Fill;
+                tiles[i].Margin = new Padding(i % 2 == 0 ? 0 : 7, i < 2 ? 0 : 7, i % 2 == 0 ? 7 : 0, i >= 4 ? 0 : 7);
+                grid2.Controls.Add(tiles[i], i % 2, i / 2);
+            }
+
+            // ---- this PC + activity
+            var card = new Card { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 16) };
+            var t = Table(1, 6, Theme.Card);
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            pcInfo = MakeLabel("", Theme.F(8.5f), Theme.Soft, ContentAlignment.TopLeft);
+            pcInfo.AutoEllipsis = false;
+            drives = new DriveList { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 0) };
+            toolsLog = MakeLog();
+
+            t.Controls.Add(MakeLabel("This PC", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
+            t.Controls.Add(pcInfo, 0, 1);
+            t.Controls.Add(Caption("DRIVES"), 0, 2);
+            t.Controls.Add(drives, 0, 3);
+            t.Controls.Add(Caption("ACTIVITY"), 0, 4);
+            t.Controls.Add(toolsLog, 0, 5);
+            card.Controls.Add(t);
+
+            body.Controls.Add(grid2, 0, 0);
+            body.Controls.Add(card, 1, 0);
+            layout.Controls.Add(toolsHeader, 0, 0);
+            layout.Controls.Add(body, 0, 1);
+            page.Controls.Add(layout);
+            return page;
+        }
+
+        private void RefreshPcInfo()
+        {
+            string win = "Windows", cpu = "Unknown CPU";
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
+                {
+                    string name = Convert.ToString(k.GetValue("ProductName"));
+                    int build;
+                    int.TryParse(Convert.ToString(k.GetValue("CurrentBuildNumber")), out build);
+                    if (build >= 22000) name = name.Replace("Windows 10", "Windows 11"); // Win11 still reports "Windows 10"
+                    string ver = Convert.ToString(k.GetValue("DisplayVersion"));
+                    win = name + (string.IsNullOrEmpty(ver) ? "" : " (" + ver + ")");
+                }
+                using (var k = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0"))
+                    cpu = Convert.ToString(k.GetValue("ProcessorNameString")).Trim();
+            }
+            catch { }
+            var m = Memory();
+            var up = TimeSpan.FromMilliseconds(GetTickCount64());
+            string upText = up.Days > 0 ? up.Days + "d " + up.Hours + "h" : up.Hours + "h " + up.Minutes + "m";
+            pcInfo.Text = win + "\n" + cpu + "\n" +
+                          "RAM  " + Theme.FormatBytes((long)(m.ullTotalPhys - m.ullAvailPhys)) + " used of " + Theme.FormatBytes((long)m.ullTotalPhys) +
+                          " (" + m.dwMemoryLoad + "%)\n" +
+                          "Up for  " + upText + (up.TotalDays >= 3 ? "  \u2014 a restart would help" : "");
+            drives.Invalidate();
+        }
+
+        /// Runs a tool on a background thread, logging what it says. Only one tool runs at a time.
+        private void RunTool(string name, Func<bool> work)
+        {
+            if (toolBusy)
+            {
+                ThemedDialog.Show(this, "Please wait", "Another tool is still running.", new[] { "OK" }, 0, Theme.Blue);
+                return;
+            }
+            toolBusy = true;
+            toolsHeader.Subtitle = name + " is running\u2026";
+            AddLog(toolsLog, name + ": started");
+            var th = new Thread(() =>
+            {
+                bool ok;
+                try { ok = work(); }
+                catch (Exception ex) { ok = false; ToolLog(name + ": " + ex.Message); }
+                Ui(() =>
+                {
+                    toolBusy = false;
+                    toolsHeader.Subtitle = name + (ok ? " finished." : " didn't finish \u2014 see Activity.");
+                    AddLog(toolsLog, name + (ok ? ": done" : ": failed"));
+                    RefreshPcInfo();
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void ToolLog(string line)
+        {
+            Ui(() => AddLog(toolsLog, line));
+        }
+
+        private static string Clean(string s)
+        {
+            return (s ?? "").Replace("\0", "");
+        }
+
+        // ---- 1. Free up RAM
+
+        private void FreeRam()
+        {
+            RunTool("Free Up RAM", () =>
+            {
+                ulong before = Memory().ullAvailPhys;
+                int trimmed = 0;
+                foreach (var p in Process.GetProcesses())
+                {
+                    try { if (p.Id > 4 && EmptyWorkingSet(p.Handle)) trimmed++; }
+                    catch { }
+                    finally { p.Dispose(); }
+                }
+                Thread.Sleep(800);
+                ulong after = Memory().ullAvailPhys;
+                long freed = after > before ? (long)(after - before) : 0;
+                ToolLog("Freed " + Theme.FormatBytes(freed) + " from " + trimmed + " processes.");
+                Ui(() => ThemedDialog.Show(this, "RAM freed",
+                    Theme.FormatBytes(freed) + " of memory was released.\n\nAvailable now: " + Theme.FormatBytes((long)after) + ".",
+                    new[] { "OK" }, 0, Theme.Green));
+                return true;
+            });
+        }
+
+        // ---- 2. Repair Windows (DISM + SFC)
+
+        private void RepairWindows()
+        {
+            if (!isAdmin) { NeedAdmin(); return; }
+            int a = ThemedDialog.Show(this, "Repair Windows?",
+                "This checks every Windows system file and repairs damaged ones. It usually takes 10\u201330 minutes and needs an internet connection.\n\n" +
+                "You can keep using the PC while it runs.",
+                new[] { "Start Repair", "Cancel" }, 0, Theme.Blue);
+            if (a != 0) return;
+
+            RunTool("Repair Windows", () =>
+            {
+                int code;
+                ToolLog("Step 1/2: DISM is repairing the Windows image\u2026");
+                string dism = Clean(Native.Run("dism.exe", "/Online /Cleanup-Image /RestoreHealth", out code));
+                ToolLog(code == 0 ? "DISM: Windows image is healthy." : "DISM finished with code " + code + ".");
+
+                ToolLog("Step 2/2: SFC is checking system files\u2026");
+                string sfc = Clean(Native.Run("sfc.exe", "/scannow", out code));
+                string result;
+                if (sfc.Contains("did not find any integrity violations")) result = "No problems found. Your Windows files are healthy.";
+                else if (sfc.Contains("successfully repaired")) result = "Damaged files were found and repaired. Restart your PC to finish.";
+                else if (sfc.Contains("unable to fix")) result = "Some damaged files could not be repaired. Run the repair again after a restart.";
+                else result = "The check finished (code " + code + ").";
+                ToolLog("SFC: " + result);
+                Ui(() => ThemedDialog.Show(this, "Repair finished", result, new[] { "OK" }, 0, Theme.Green));
+                return true;
+            });
+        }
+
+        // ---- 3. Fix internet
+
+        private void FixInternet()
+        {
+            if (!isAdmin) { NeedAdmin(); return; }
+            int a = ThemedDialog.Show(this, "Fix internet connection?",
+                "This clears the DNS cache and resets Winsock and TCP/IP settings. Your internet may drop for a few seconds.\n\n" +
+                "Restart the PC afterwards for the full fix.",
+                new[] { "Fix Now", "Cancel" }, 0, Theme.Blue);
+            if (a != 0) return;
+
+            RunTool("Fix Internet", () =>
+            {
+                int code;
+                Native.Run("ipconfig.exe", "/flushdns", out code); ToolLog("DNS cache cleared" + (code == 0 ? "" : " (code " + code + ")"));
+                Native.Run("netsh.exe", "winsock reset", out code); ToolLog("Winsock reset" + (code == 0 ? "" : " (code " + code + ")"));
+                Native.Run("netsh.exe", "int ip reset", out code); ToolLog("TCP/IP reset" + (code == 0 ? "" : " (code " + code + ")"));
+                Native.Run("ipconfig.exe", "/renew", out code); ToolLog("IP address renewed" + (code == 0 ? "" : " (code " + code + ")"));
+                Ui(() =>
+                {
+                    int r = ThemedDialog.Show(this, "Network reset done",
+                        "Restart your PC to finish the fix.", new[] { "Restart Later", "Restart Now" }, 0, Theme.Green);
+                    if (r == 1) { int c; Native.Run("shutdown.exe", "/r /t 5", out c); }
+                });
+                return true;
+            });
+        }
+
+        // ---- 4. Restart Explorer
+
+        private static bool RestartExplorer()
+        {
+            foreach (var p in Process.GetProcessesByName("explorer"))
+            {
+                try { p.Kill(); p.WaitForExit(3000); } catch { }
+                finally { p.Dispose(); }
+            }
+            // Windows normally restarts the shell by itself; start it if it didn't
+            for (int i = 0; i < 20; i++)
+            {
+                Thread.Sleep(250);
+                if (Process.GetProcessesByName("explorer").Length > 0) return true;
+            }
+            Process.Start(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"));
+            return true;
+        }
+
+        // ---- 5. Disk health
+
+        private void DiskHealth()
+        {
+            RunTool("Disk Health", () =>
+            {
+                int code;
+                string o = Native.Run("powershell.exe",
+                    "-NoProfile -NonInteractive -Command \"Get-PhysicalDisk | ForEach-Object { $_.FriendlyName + '|' + $_.MediaType + '|' + $_.HealthStatus + '|' + $_.Size }\"",
+                    out code);
+                var lines = o.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Where(l => l.Contains("|")).ToList();
+                if (lines.Count == 0) { ToolLog("Couldn't read disk health."); return false; }
+
+                bool allOk = true;
+                var report = new List<string>();
+                foreach (var l in lines)
+                {
+                    var p = l.Split('|');
+                    long size;
+                    long.TryParse(p.Length > 3 ? p[3] : "0", out size);
+                    string health = p.Length > 2 ? p[2].Trim() : "Unknown";
+                    if (!health.Equals("Healthy", StringComparison.OrdinalIgnoreCase)) allOk = false;
+                    string line = p[0].Trim() + "  (" + (p.Length > 1 ? p[1].Trim() : "") + ", " + Theme.FormatBytes(size) + ")  \u2014  " + health;
+                    report.Add("\u2022  " + line);
+                    ToolLog(line);
+                }
+                string msg = string.Join("\n", report.ToArray()) + "\n\n" +
+                    (allOk ? "All drives report healthy." : "A drive reports a problem. Back up your important files as soon as possible.");
+                Ui(() => ThemedDialog.Show(this, allOk ? "Drives are healthy" : "Drive warning", msg, new[] { "OK" }, 0, allOk ? Theme.Green : Theme.Red));
+                return true;
+            });
+        }
+
+        // ---- 6. Battery report
+
+        private void BatteryReport()
+        {
+            RunTool("Battery Report", () =>
+            {
+                string file = Path.Combine(AppInfo.DataDir, "battery-report.html");
+                int code;
+                string o = Native.Run("powercfg.exe", "/batteryreport /output \"" + file + "\"", out code);
+                if (code != 0 || !File.Exists(file))
+                {
+                    ToolLog("No battery found \u2014 this looks like a desktop PC.");
+                    Ui(() => ThemedDialog.Show(this, "No battery found", "This PC doesn't have a battery, so there's no report to show.", new[] { "OK" }, 0, Theme.Blue));
+                    return true;
+                }
+                ToolLog("Battery report saved and opened.");
+                Process.Start(new ProcessStartInfo(file) { UseShellExecute = true });
+                return true;
+            });
+        }
+
+        private void NeedAdmin()
+        {
+            ThemedDialog.Show(this, "Administrator needed",
+                "This tool needs administrator rights. Close the app, right-click it and choose \"Run as administrator\".",
+                new[] { "OK" }, 0, Theme.Amber);
+        }
+
         private Control BuildSettingsPage()
         {
             var page = NewPage();
@@ -2670,8 +3408,35 @@ namespace StopProcessing
             a.Controls.Add(lic, 0, 5);
             about.Controls.Add(a);
 
+            // ---- general card (start-up + tray)
+            var general = new Card { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 12), Margin = new Padding(0, 0, 0, 14) };
+            var gt = Table(1, 4, Theme.Card);
+            gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+            gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
+            gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
+            gt.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            var startToggle = new CheckToggle { Text = "Start with Windows (in the tray)", Dock = DockStyle.Fill, Checked = settings.StartWithWindows };
+            startToggle.CheckedChanged += (s, e) =>
+            {
+                settings.StartWithWindows = startToggle.Checked;
+                settings.Save();
+                SyncStartupTask();
+            };
+            var trayToggle = new CheckToggle { Text = "Close button keeps it in the tray", Dock = DockStyle.Fill, Checked = settings.CloseToTray };
+            trayToggle.CheckedChanged += (s, e) => { settings.CloseToTray = trayToggle.Checked; settings.Save(); };
+            gt.Controls.Add(MakeLabel("General", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
+            gt.Controls.Add(startToggle, 0, 1);
+            gt.Controls.Add(trayToggle, 0, 2);
+            general.Controls.Add(gt);
+
+            var right = Table(1, 2, Theme.Bg);
+            right.RowStyles.Add(new RowStyle(SizeType.Absolute, 136F));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            right.Controls.Add(general, 0, 0);
+            right.Controls.Add(about, 0, 1);
+
             body.Controls.Add(card, 0, 0);
-            body.Controls.Add(about, 1, 0);
+            body.Controls.Add(right, 1, 0);
             layout.Controls.Add(header, 0, 0);
             layout.Controls.Add(body, 0, 1);
             page.Controls.Add(layout);
@@ -2725,7 +3490,7 @@ namespace StopProcessing
                     {
                         pendingUpdate = null;
                         installUpdateButton.Enabled = false;
-                        navItems[3].Badge = false;
+                        navItems[SettingsPage].Badge = false;
                         SetUpdateStatus("You're up to date", Theme.Green);
                         updNotes.Text = info != null && !string.IsNullOrEmpty(info.Notes)
                             ? "What's in " + info.Tag + ":\r\n\r\n" + info.Notes.Replace("\r\n", "\n").Replace("\n", "\r\n")
@@ -2735,7 +3500,7 @@ namespace StopProcessing
 
                     pendingUpdate = info;
                     installUpdateButton.Enabled = true;
-                    navItems[3].Badge = true;
+                    navItems[SettingsPage].Badge = true;
                     SetUpdateStatus("Version " + info.Tag.TrimStart('v', 'V') + " is available", Theme.Blue);
                     updNotes.Text = string.IsNullOrEmpty(info.Notes)
                         ? "No release notes."
@@ -2795,17 +3560,24 @@ namespace StopProcessing
                     }
 
                     updateInstalled = true;
-                    navItems[3].Badge = false;
+                    navItems[SettingsPage].Badge = false;
                     updProgress.Value = 100;
                     SetUpdateStatus("Update installed \u2014 restart to finish", Theme.Green);
 
                     if (isStopping || isCleaning) return; // don't interrupt a running job
+
+                    if (!Visible)
+                    {
+                        // running quietly in the tray: restart straight back into the tray
+                        try { Updater.Restart(true); reallyExit = true; Close(); } catch { reallyExit = false; }
+                        return;
+                    }
                     int ans = ThemedDialog.Show(this, "Update ready",
-                        "Stop Processing " + info.Tag.TrimStart('v', 'V') + " has been installed. Restart the app now to use it?",
+                        "Vibe Stop Processing " + info.Tag.TrimStart('v', 'V') + " has been installed. Restart the app now to use it?",
                         new[] { "Restart now", "Later" }, 0, Theme.Green);
                     if (ans == 0)
                     {
-                        try { Updater.Restart(); Close(); } catch { }
+                        try { Updater.Restart(false); reallyExit = true; Close(); } catch { reallyExit = false; }
                     }
                 });
             });
@@ -2817,14 +3589,32 @@ namespace StopProcessing
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (isStopping || isCleaning)
+            bool systemClosing = e.CloseReason == CloseReason.WindowsShutDown || e.CloseReason == CloseReason.TaskManagerClosing;
+
+            // the close button only hides the window; Exit from the tray menu really quits
+            if (!reallyExit && !systemClosing && settings.CloseToTray && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                if (!settings.TrayHintShown)
+                {
+                    settings.TrayHintShown = true;
+                    settings.Save();
+                    tray.ShowBalloonTip(5000, "Vibe Stop Processing is still running",
+                        "It's in the system tray. Right-click the icon and choose Exit to close it.", ToolTipIcon.Info);
+                }
+                return;
+            }
+
+            if ((isStopping || isCleaning) && !systemClosing)
             {
                 int r = ThemedDialog.Show(this, "Still working",
                     "A run is still in progress. Close anyway?", new[] { "Close", "Keep open" }, 1, Theme.Amber);
                 if (r != 0) { e.Cancel = true; return; }
-                if (stopCancel != null) stopCancel.Cancel();
             }
+            if (stopCancel != null) stopCancel.Cancel();
             if (refreshTimer != null) refreshTimer.Stop();
+            if (tray != null) { tray.Visible = false; tray.Dispose(); }
             base.OnFormClosing(e);
         }
 
@@ -2837,12 +3627,30 @@ namespace StopProcessing
             public string Role;
         }
 
+        private static Mutex singleInstance;
+
         [STAThread]
         static void Main()
         {
+            // only one copy runs; starting it again just brings the existing window forward
+            bool owned;
+            singleInstance = new Mutex(true, @"Local\VibeStopProcessing_SingleInstance", out owned);
+            if (!owned && Environment.GetCommandLineArgs().Contains("--updated"))
+            {
+                // after an update the old copy is still closing - wait for it
+                try { owned = singleInstance.WaitOne(15000); }
+                catch (AbandonedMutexException) { owned = true; }
+            }
+            if (!owned)
+            {
+                Native.PostMessage((IntPtr)0xffff, WM_SHOWME, IntPtr.Zero, IntPtr.Zero);
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
+            GC.KeepAlive(singleInstance);
         }
     }
 

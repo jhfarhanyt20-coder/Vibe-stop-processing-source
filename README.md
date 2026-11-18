@@ -35,6 +35,7 @@ Running a newer installer over an existing install upgrades it in place.
 | Windows temp files (`C:\Windows\Temp`) | ✅ |
 | Thumbnail cache | ✅ |
 | Crash dumps and error reports | ✅ |
+| Browser cache: Chrome, Edge, Brave, Opera, Vivaldi, Firefox (logins and history are kept) | ✅ |
 | Windows Update download cache | ⬜ |
 | Prefetch data | ⬜ |
 | Recycle Bin | ⬜ |
@@ -58,7 +59,26 @@ Running a newer installer over an existing install upgrades it in place.
 
 > **Still turning on by itself?** Open the BIOS (usually `Del` or `F2`) and set *Restore on AC Power Loss → Power Off*, *Wake on LAN → Disabled*, *RTC Alarm → Disabled*, *ErP → Enabled*.
 
-### 4. Settings: automatic updates
+### 4. Tools: one-click fixes
+| Tool | What it does |
+|---|---|
+| **Free Up RAM** | Releases memory that apps are holding but not using, and shows how much was freed |
+| **Repair Windows** | Runs DISM + SFC to find and repair damaged Windows system files |
+| **Fix Internet** | Flushes DNS and resets Winsock, TCP/IP and the IP address |
+| **Restart Explorer** | Fixes a frozen taskbar, Start menu or desktop |
+| **Disk Health** | Shows whether each HDD/SSD reports *Healthy*, and warns you to back up if it doesn't |
+| **Battery Report** | Opens Windows' detailed laptop battery report (capacity and wear) |
+
+The **This PC** panel shows the Windows version, CPU, RAM use, uptime, and free space on every drive.
+
+### 5. Runs quietly in the system tray
+- The **✕** button hides the app to the tray (next to the clock) instead of closing it.
+- **Click** the tray icon to open the app. **Right-click** it for quick links (Processes, Cleaner, Power Fix, Tools, Settings, Shut Down PC) and **Exit**.
+- **Starts with Windows** in the tray. It uses a scheduled task, so there's no UAC prompt at sign-in.
+- Only one copy runs at a time. Opening the app again just brings the existing window forward.
+- You can turn both behaviours off in **Settings → General**.
+
+### 6. Settings: automatic updates
 - **Install updates automatically** is on by default. A few seconds after the app starts, it checks for a new version, downloads it and installs it, then asks whether to restart now.
 - With auto update **off**, the app tells you a new version exists and you install it yourself with **Check for Updates → Install Update**.
 - Each update is checked before it's installed: the file size, the SHA-256 checksum and whether it's a valid program. If anything fails, the old version is kept.

@@ -56,6 +56,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent shellexec
 
+[UninstallRun]
+; remove the "start with Windows" task the app created
+Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""VibeStopProcessing_{username}"" /f"; Flags: runhidden; RunOnceId: "RemoveStartupTask"
+; make sure the tray app isn't running while files are removed
+Filename: "{sys}\taskkill.exe"; Parameters: "/f /im {#AppExe}"; Flags: runhidden; RunOnceId: "StopApp"
+
 [UninstallDelete]
 Type: files; Name: "{app}\{#AppExe}.old"
 Type: files; Name: "{app}\{#AppExe}.download"
