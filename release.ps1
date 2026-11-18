@@ -1,17 +1,24 @@
 # Publishes a new version of Vibe Stop Processing.
-# Usage:  .\release.ps1 -Version 2.2.0 -Notes "What changed in this version"
+# Rule: every release goes up by 0.1 automatically (2.1.0 -> 2.2.0 -> 2.3.0 ...).
+# Usage:  .\release.ps1 -Notes "What changed in this version"
 # Users with "Install updates automatically" on get it on their next app start.
 
 param(
-    [Parameter(Mandatory = $true)][string]$Version,
     [string]$Notes = ""
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Version must look like 2.2.0" }
-if (git tag --list "v$Version") { throw "v$Version already exists. Use a higher version number." }
+# find the highest released version and add 0.1
+git fetch --tags --quiet
+$latest = git tag --list "v*" |
+    Where-Object { $_ -match '^v(\d+)\.(\d+)\.(\d+)$' } |
+    ForEach-Object { [version]($_.TrimStart('v')) } |
+    Sort-Object -Descending | Select-Object -First 1
+if ($latest) { $Version = "{0}.{1}.0" -f $latest.Major, ($latest.Minor + 1) }
+else { $Version = "1.1.0" }
+Write-Host "Releasing v$Version (previous: v$latest)" -ForegroundColor Cyan
 
 # 1. stamp the version into the source
 $path = Join-Path $PSScriptRoot 'StopProcessing.cs'
