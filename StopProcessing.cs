@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Vibe")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.0.0")]
-[assembly: AssemblyFileVersion("2.5.0.0")]
+[assembly: AssemblyVersion("2.5.1.0")]
+[assembly: AssemblyFileVersion("2.5.1.0")]
 
 namespace StopProcessing
 {
@@ -1061,6 +1061,7 @@ namespace StopProcessing
     class ToolTile : Control
     {
         public string Glyph, Desc;
+        public bool Danger;
         private readonly Action run;
         private bool hot;
 
@@ -1087,8 +1088,9 @@ namespace StopProcessing
             Theme.FillRound(g, hot ? Theme.CardHi : Theme.Card, new Rectangle(0, 0, Width - 1, Height - 1), 12);
 
             var tile = new Rectangle(20, 20, 44, 44);
-            Theme.FillRound(g, Color.FromArgb(38, 48, 66), tile, 11);
-            TextRenderer.DrawText(g, Glyph, Theme.Icon(15f), tile, Theme.Blue,
+            Color accent = Danger ? Theme.Red : Theme.Blue;
+            Theme.FillRound(g, Theme.Mix(Theme.Card, accent, 0.18), tile, 11);
+            TextRenderer.DrawText(g, Glyph, Theme.Icon(15f), tile, accent,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             var tf = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix;
@@ -1202,8 +1204,11 @@ namespace StopProcessing
     {
         private int result = -1;
 
-        private ThemedDialog(string title, string message, string[] buttons, int primary, Color accent)
+        private int enterIndex;
+
+        private ThemedDialog(string title, string message, string[] buttons, int primary, Color accent, int enter)
         {
+            enterIndex = enter == -2 ? primary : enter;
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterParent;
             ShowInTaskbar = false;
@@ -1258,7 +1263,7 @@ namespace StopProcessing
             KeyDown += (s, e) =>
             {
                 if (e.KeyCode == Keys.Escape) { result = -1; Close(); }
-                else if (e.KeyCode == Keys.Enter) { result = primary; Close(); }
+                else if (e.KeyCode == Keys.Enter) { result = enterIndex; Close(); }
             };
         }
 
@@ -1272,9 +1277,10 @@ namespace StopProcessing
             }
         }
 
-        public static int Show(IWin32Window owner, string title, string message, string[] buttons, int primary, Color accent)
+        /// enterIndex: which button the Enter key presses (-2 = the primary one). Use a safe button for destructive dialogs.
+        public static int Show(IWin32Window owner, string title, string message, string[] buttons, int primary, Color accent, int enterIndex = -2)
         {
-            using (var d = new ThemedDialog(title, message, buttons, primary, accent))
+            using (var d = new ThemedDialog(title, message, buttons, primary, accent, enterIndex))
             {
                 d.ShowDialog(owner);
                 return d.result;
@@ -3027,12 +3033,12 @@ namespace StopProcessing
             body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330F));
 
-            // ---- tool tiles (2 x 3)
-            var grid2 = Table(2, 3, Theme.Bg);
+            // ---- tool tiles (2 x 3) + a full-width "Delete Permanently" row
+            var grid2 = Table(2, 4, Theme.Bg);
             grid2.Margin = new Padding(0, 0, 14, 0);
             grid2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
             grid2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
-            for (int i = 0; i < 3; i++) grid2.RowStyles.Add(new RowStyle(SizeType.Percent, 33.3F));
+            for (int i = 0; i < 4; i++) grid2.RowStyles.Add(new RowStyle(SizeType.Percent, 25F));
 
             var tiles = new[]
             {
@@ -3046,9 +3052,14 @@ namespace StopProcessing
             for (int i = 0; i < tiles.Length; i++)
             {
                 tiles[i].Dock = DockStyle.Fill;
-                tiles[i].Margin = new Padding(i % 2 == 0 ? 0 : 7, i < 2 ? 0 : 7, i % 2 == 0 ? 7 : 0, i >= 4 ? 0 : 7);
+                tiles[i].Margin = new Padding(i % 2 == 0 ? 0 : 7, i < 2 ? 0 : 7, i % 2 == 0 ? 7 : 0, 7);
                 grid2.Controls.Add(tiles[i], i % 2, i / 2);
             }
+            var wipe = new ToolTile("\uE74D", "Delete Permanently",
+                "Erase any file or folder, even locked ones that won't delete normally (like a huge node_modules). Skips the Recycle Bin \u2014 can't be undone.",
+                ShowPermanentDelete) { Dock = DockStyle.Fill, Margin = new Padding(0, 7, 0, 0), Danger = true };
+            grid2.Controls.Add(wipe, 0, 3);
+            grid2.SetColumnSpan(wipe, 2);
 
             // ---- this PC + activity
             var card = new Card { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 16) };
@@ -3301,6 +3312,14 @@ namespace StopProcessing
                 Process.Start(new ProcessStartInfo(file) { UseShellExecute = true });
                 return true;
             });
+        }
+
+        private void ShowPermanentDelete()
+        {
+            if (!Visible) ShowFromTray(-1);
+            using (var f = new PermanentDeleteForm(line => AddLog(toolsLog, line)))
+                f.ShowDialog(this);
+            RefreshPcInfo();
         }
 
         private void NeedAdmin()
@@ -3665,6 +3684,592 @@ namespace StopProcessing
     // ------------------------------------------------------------------
     //  Shell pieces
     // ------------------------------------------------------------------
+    /// "Delete Permanently": wipes a folder and everything in it without using the Recycle Bin.
+    class PermanentDeleteForm : Form
+    {
+        private readonly TextBox pathBox;
+        private readonly Label info;
+        private readonly FlatButton deleteBtn, cancelBtn, browseBtn;
+        private readonly CheckToggle keepFolder;
+        private readonly System.Windows.Forms.Timer debounce;
+        private readonly Action<string> log;
+        private int scanId;
+        private string scanPath;
+        private long scanSize;
+        private int scanFiles;
+        private volatile bool deleting;
+
+        public PermanentDeleteForm(Action<string> log)
+        {
+            this.log = log;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            BackColor = Theme.Line;
+            Padding = new Padding(1);
+            KeyPreview = true;
+            ClientSize = new Size(600, 340);
+
+            var inner = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Surface };
+            inner.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) Native.DragWindow(this); };
+            Controls.Add(inner);
+            inner.Controls.Add(new Panel { BackColor = Theme.Red, Bounds = new Rectangle(0, 0, 598, 3) });
+            inner.Controls.Add(new Label { Text = "Delete Permanently", Font = Theme.F(13f, FontStyle.Bold), ForeColor = Theme.Text, AutoSize = true, Location = new Point(24, 22) });
+            inner.Controls.Add(new Label
+            {
+                Text = "Deletes a file or folder (with everything inside) \u2014 even locked ones. Nothing goes to the Recycle Bin.",
+                Font = Theme.F(9.5f), ForeColor = Theme.Muted, Bounds = new Rectangle(25, 56, 550, 22), UseMnemonic = false
+            });
+            inner.Controls.Add(new Label { Text = "FILE OR FOLDER PATH", Font = Theme.Semi(8f), ForeColor = Theme.Faint, Bounds = new Rectangle(25, 90, 200, 18) });
+
+            var pathHost = new Panel { BackColor = Theme.Inset, Bounds = new Rectangle(24, 110, 430, 38) };
+            pathBox = new TextBox
+            {
+                BorderStyle = BorderStyle.None, BackColor = Theme.Inset, ForeColor = Theme.Text,
+                Font = Theme.F(10f), Bounds = new Rectangle(10, 10, 410, 22)
+            };
+            pathHost.Controls.Add(pathBox);
+            inner.Controls.Add(pathHost);
+
+            browseBtn = new FlatButton { Text = "Browse", Glyph = "\uE8B7", Bounds = new Rectangle(464, 110, 112, 38), Font = Theme.Semi(9.5f) };
+            browseBtn.SetColor(Theme.Secondary);
+            browseBtn.Click += (s, e) => Browse();
+            inner.Controls.Add(browseBtn);
+
+            info = new Label
+            {
+                Text = "Type or paste a folder path, or click Browse.", Font = Theme.F(9.5f), ForeColor = Theme.Soft,
+                Bounds = new Rectangle(25, 158, 550, 22), UseMnemonic = false, AutoEllipsis = true
+            };
+            inner.Controls.Add(info);
+
+            keepFolder = new CheckToggle { Text = "Keep the empty folder (delete only what's inside it)", Bounds = new Rectangle(24, 186, 520, 30) };
+            inner.Controls.Add(keepFolder);
+
+            var warn = new Panel { BackColor = Theme.Mix(Theme.Surface, Theme.Red, 0.16), Bounds = new Rectangle(24, 226, 552, 44) };
+            warn.Controls.Add(new Label { Text = "\uE7BA", Font = Theme.Icon(13f), ForeColor = Theme.Red, Bounds = new Rectangle(12, 0, 26, 44), TextAlign = ContentAlignment.MiddleLeft });
+            warn.Controls.Add(new Label
+            {
+                Text = "Files deleted here can NOT be recovered. Double-check the path before you continue.",
+                Font = Theme.Semi(9.5f), ForeColor = Theme.Lighten(Theme.Red, 0.25), Bounds = new Rectangle(42, 0, 500, 44),
+                TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false
+            });
+            inner.Controls.Add(warn);
+
+            deleteBtn = new FlatButton { Text = "Delete Permanently", Glyph = "\uE74D", Bounds = new Rectangle(576 - 190, 286, 190, 38), Font = Theme.Semi(9.5f), Enabled = false };
+            deleteBtn.SetColor(Theme.Red);
+            deleteBtn.Click += (s, e) => ConfirmAndDelete();
+            inner.Controls.Add(deleteBtn);
+            cancelBtn = new FlatButton { Text = "Cancel", Bounds = new Rectangle(576 - 190 - 10 - 110, 286, 110, 38), Font = Theme.Semi(9.5f) };
+            cancelBtn.SetColor(Theme.Secondary);
+            cancelBtn.Click += (s, e) => Close();
+            inner.Controls.Add(cancelBtn);
+
+            debounce = new System.Windows.Forms.Timer { Interval = 600 };
+            debounce.Tick += (s, e) => { debounce.Stop(); Scan(); };
+            pathBox.TextChanged += (s, e) => { deleteBtn.Enabled = false; debounce.Stop(); debounce.Start(); };
+            KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape && !deleting) Close(); };
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.ClassStyle |= 0x20000; return cp; }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (deleting) { e.Cancel = true; return; } // never leave half-way
+            debounce.Stop();
+            base.OnFormClosing(e);
+        }
+
+        private void Browse()
+        {
+            using (var dlg = new FolderBrowserDialog { Description = "Choose the folder to delete permanently", ShowNewFolderButton = false })
+            {
+                if (Directory.Exists(pathBox.Text.Trim().Trim('"'))) dlg.SelectedPath = pathBox.Text.Trim().Trim('"');
+                if (dlg.ShowDialog(this) == DialogResult.OK) pathBox.Text = dlg.SelectedPath;
+            }
+        }
+
+        /// Returns why a path must not be wiped, or null if it's allowed.
+        public static string BlockedReason(string full)
+        {
+            string f = full.TrimEnd('\\');
+            string root = (Path.GetPathRoot(f) ?? "").TrimEnd('\\');
+            if (string.Equals(f, root, StringComparison.OrdinalIgnoreCase)) return "That is a whole drive.";
+
+            string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var protectedDirs = new[]
+            {
+                win,
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                profile,
+                Path.GetDirectoryName(profile),
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyMusic),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                Path.Combine(profile, "Downloads"),
+                Path.Combine(profile, "OneDrive"),
+                Path.GetDirectoryName(Application.ExecutablePath)
+            };
+            foreach (var p in protectedDirs)
+            {
+                if (string.IsNullOrEmpty(p)) continue;
+                string pp = p.TrimEnd('\\');
+                if (string.Equals(f, pp, StringComparison.OrdinalIgnoreCase))
+                    return "This is an important Windows or user folder.";
+                if (pp.StartsWith(f + "\\", StringComparison.OrdinalIgnoreCase))
+                    return "This folder contains important Windows or user folders.";
+            }
+            if (f.StartsWith(win + "\\", StringComparison.OrdinalIgnoreCase)) return "Files inside the Windows folder are protected.";
+            return null;
+        }
+
+        private string ResolvePath(out string error)
+        {
+            error = null;
+            string raw = pathBox.Text.Trim().Trim('"').Trim();
+            if (raw.Length == 0) { error = "Type or paste a folder path, or click Browse."; return null; }
+            string full;
+            try { full = Path.GetFullPath(raw).TrimEnd('\\'); }
+            catch { error = "That path isn't valid."; return null; }
+            if (!File.Exists(full) && !Directory.Exists(full)) { error = "Nothing found at that path."; return null; }
+            string blocked = BlockedReason(full);
+            if (blocked != null) { error = "Blocked for safety: " + blocked; return null; }
+            return full;
+        }
+
+        private void Scan()
+        {
+            string error;
+            string full = ResolvePath(out error);
+            int id = ++scanId;
+            scanPath = null;
+            deleteBtn.Enabled = false;
+            if (full == null)
+            {
+                info.ForeColor = error.StartsWith("Blocked") ? Theme.Amber : Theme.Soft;
+                info.Text = error;
+                return;
+            }
+            info.ForeColor = Theme.Soft;
+            if (File.Exists(full))
+            {
+                long len = 0;
+                try { len = new FileInfo(full).Length; } catch { }
+                scanPath = full;
+                scanSize = len;
+                scanFiles = 1;
+                keepFolder.Checked = false;
+                keepFolder.Enabled = false;
+                info.ForeColor = Theme.Text;
+                info.Text = "1 file  \u00b7  " + Theme.FormatBytes(len);
+                deleteBtn.Enabled = true;
+                return;
+            }
+            keepFolder.Enabled = true;
+            info.Text = "Calculating size\u2026";
+            var th = new Thread(() =>
+            {
+                long size = 0;
+                int files = 0, folders = 0;
+                var stack = new Stack<string>();
+                stack.Push(full);
+                while (stack.Count > 0 && id == scanId)
+                {
+                    string d = stack.Pop();
+                    try
+                    {
+                        foreach (var f in Directory.GetFiles(d))
+                        {
+                            files++;
+                            try { size += new FileInfo(f).Length; } catch { }
+                        }
+                        foreach (var s in Directory.GetDirectories(d))
+                        {
+                            folders++;
+                            try { if ((File.GetAttributes(s) & FileAttributes.ReparsePoint) != 0) continue; } catch { continue; }
+                            stack.Push(s);
+                        }
+                    }
+                    catch { }
+                    if (files % 3000 == 0)
+                    {
+                        int fc = files;
+                        Post(() => { if (id == scanId) info.Text = "Calculating size\u2026 " + fc.ToString("N0") + " files so far"; });
+                    }
+                }
+                long sz = size;
+                int fl = files, fo = folders;
+                Post(() =>
+                {
+                    if (id != scanId || IsDisposed) return;
+                    scanPath = full;
+                    scanSize = sz;
+                    scanFiles = fl;
+                    info.ForeColor = Theme.Text;
+                    info.Text = Plural(fl, "file") + " in " + Plural(fo + 1, "folder") + "  \u00B7  " + Theme.FormatBytes(sz);
+                    deleteBtn.Enabled = true;
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void Post(Action a)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(a); } catch { }
+        }
+
+        private void ConfirmAndDelete()
+        {
+            string full = scanPath;
+            if (full == null || deleting) return;
+            bool isDir = Directory.Exists(full);
+            bool keep = isDir && keepFolder.Checked;
+
+            int a = ThemedDialog.Show(this, "Delete permanently?",
+                "You are about to PERMANENTLY delete" + (keep ? " everything inside" : "") + ":\n\n" +
+                full + "\n\n" +
+                Plural(scanFiles, "file") + "  \u00B7  " + Theme.FormatBytes(scanSize) + "\n\n" +
+                "\u26A0  This can NOT be undone. Nothing will go to the Recycle Bin and it cannot be recovered.\n" +
+                "Locked items will be unlocked (ownership is taken and programs using them can be closed).",
+                new[] { "Delete Forever", "Cancel" }, 0, Theme.Red, 1);
+            if (a != 0) return;
+
+            deleting = true;
+            deleteBtn.Enabled = cancelBtn.Enabled = browseBtn.Enabled = false;
+            pathBox.ReadOnly = true;
+            keepFolder.Enabled = false;
+            if (log != null) log("Delete Permanently: " + full);
+
+            var th = new Thread(() =>
+            {
+                string outcome;
+                Color color;
+                RunDelete(full, isDir, keep, out outcome, out color);
+                Post(() =>
+                {
+                    deleting = false;
+                    cancelBtn.Enabled = true;
+                    cancelBtn.Text = "Close";
+                    info.ForeColor = color;
+                    info.Text = outcome;
+                    if (log != null) log(outcome);
+                    if (color != Theme.Green)
+                    {
+                        pathBox.ReadOnly = false;
+                        keepFolder.Enabled = isDir;
+                        browseBtn.Enabled = true;
+                    }
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void Status(string text)
+        {
+            Post(() => { info.ForeColor = Theme.Amber; info.Text = text; });
+        }
+
+        private static string Plural(int n, string word)
+        {
+            return n.ToString("N0") + " " + word + (n == 1 ? "" : "s");
+        }
+
+        // ---- the escalating delete: normal -> take ownership -> close locking programs -> delete on restart
+
+        private void RunDelete(string full, bool isDir, bool keep, out string outcome, out Color color)
+        {
+            Status("Deleting\u2026 very large folders can take a minute.");
+            TryDelete(full, isDir, keep);
+            if (IsGone(full, isDir, keep)) { Done(out outcome, out color, ""); return; }
+
+            // 2. "Access denied": take ownership and give Administrators full control, then retry
+            Status("Some items are protected \u2014 taking ownership\u2026");
+            int code;
+            if (isDir)
+            {
+                Native.Run("takeown.exe", "/f \"" + full + "\" /r /d y", out code);
+                Native.Run("icacls.exe", "\"" + full + "\" /grant *S-1-5-32-544:F /t /c /q", out code);
+            }
+            else
+            {
+                Native.Run("takeown.exe", "/f \"" + full + "\"", out code);
+                Native.Run("icacls.exe", "\"" + full + "\" /grant *S-1-5-32-544:F /c /q", out code);
+            }
+            TryDelete(full, isDir, keep);
+            if (IsGone(full, isDir, keep)) { Done(out outcome, out color, " (ownership was taken to unlock it)"); return; }
+
+            // 3. files are open in other programs: find them with the Restart Manager
+            Status("Some files are in use \u2014 finding which programs are using them\u2026");
+            var remaining = Remaining(full, isDir, keep);
+            var lockers = Locker.Find(remaining.Files.Where(f => f.Length < 260).Take(1000).ToList());
+            if (lockers.Count > 0)
+            {
+                var closable = lockers.Where(l => !Locker.IsCritical(l.Name)).ToList();
+                string names = string.Join("\n", lockers.Select(l => "\u2022  " + l.Name + "  (PID " + l.Pid + ")" + (Locker.IsCritical(l.Name) ? "  \u2014 Windows, can't be closed" : "")).ToArray());
+                int choice = Ask("Files are in use",
+                    "These programs are using files you want to delete:\n\n" + names + "\n\n" +
+                    (closable.Count > 0 ? "Close them now and delete? Unsaved work in them will be lost.\n" : "") +
+                    "Or delete the files automatically the next time you restart.",
+                    closable.Count > 0 ? new[] { "Close & Delete", "Delete on Restart", "Cancel" } : new[] { "Delete on Restart", "Cancel" },
+                    0, Theme.Red);
+                if (closable.Count == 0 && choice >= 0) choice++; // align with the 3-button layout
+
+                if (choice == 0)
+                {
+                    Status("Closing programs that are using the files\u2026");
+                    bool explorerClosed = false;
+                    foreach (var l in closable)
+                    {
+                        try
+                        {
+                            using (var p = Process.GetProcessById(l.Pid))
+                            {
+                                if (p.ProcessName.Equals("explorer", StringComparison.OrdinalIgnoreCase)) explorerClosed = true;
+                                p.Kill();
+                                p.WaitForExit(3000);
+                            }
+                        }
+                        catch { }
+                    }
+                    Thread.Sleep(800);
+                    TryDelete(full, isDir, keep);
+                    if (explorerClosed) EnsureExplorer();
+                    if (IsGone(full, isDir, keep)) { Done(out outcome, out color, " (programs using it were closed)"); return; }
+                }
+                else if (choice != 1)
+                {
+                    outcome = "Stopped. Some files are still there because programs are using them.";
+                    color = Theme.Amber;
+                    return;
+                }
+            }
+            else
+            {
+                int choice = Ask("Can't delete everything right now",
+                    "Some items can't be deleted while Windows is running.\n\nDelete them automatically the next time you restart the PC?",
+                    new[] { "Delete on Restart", "Cancel" }, 0, Theme.Red);
+                if (choice != 0)
+                {
+                    outcome = "Stopped. Some items could not be deleted.";
+                    color = Theme.Amber;
+                    return;
+                }
+            }
+
+            // 4. last resort: let Windows delete what's left during the next restart
+            remaining = Remaining(full, isDir, keep);
+            int scheduled = ScheduleOnRestart(remaining, full, isDir, keep);
+            outcome = scheduled > 0
+                ? "Almost done \u2014 " + Plural(scheduled, "item") + " will be deleted when you restart the PC."
+                : "Some items could not be deleted or scheduled. Restart the PC and try again.";
+            color = scheduled > 0 ? Theme.Amber : Theme.Red;
+        }
+
+        private void Done(out string outcome, out Color color, string how)
+        {
+            outcome = "\u2713 Deleted permanently \u2014 " + Theme.FormatBytes(scanSize) + " freed" + how + ".";
+            color = Theme.Green;
+        }
+
+        private int Ask(string title, string message, string[] buttons, int primary, Color accent)
+        {
+            if (IsDisposed) return -1;
+            return (int)Invoke(new Func<int>(() => ThemedDialog.Show(this, title, message, buttons, primary, accent, buttons.Length - 1)));
+        }
+
+        private static void TryDelete(string full, bool isDir, bool keep)
+        {
+            int code;
+            if (!isDir)
+            {
+                Native.Run("cmd.exe", "/c attrib -r -s -h \"" + full + "\"", out code);
+                Native.Run("cmd.exe", "/c del /f /q /a \"\\\\?\\" + full + "\"", out code);
+                return;
+            }
+            // clear read-only / hidden / system flags so nothing blocks the delete
+            Native.Run("cmd.exe", "/c attrib -r -s -h \"" + full + "\\*\" /s /d", out code);
+            if (keep)
+            {
+                string[] entries;
+                try { entries = Directory.GetFileSystemEntries(full); } catch { entries = new string[0]; }
+                foreach (var en in entries)
+                {
+                    if (Directory.Exists(en)) Native.Run("cmd.exe", "/c rd /s /q \"\\\\?\\" + en + "\"", out code);
+                    else Native.Run("cmd.exe", "/c del /f /q /a \"\\\\?\\" + en + "\"", out code);
+                }
+            }
+            else
+            {
+                // the \\?\ prefix handles very deep paths (node_modules) and odd names (trailing dots/spaces)
+                Native.Run("cmd.exe", "/c rd /s /q \"\\\\?\\" + full + "\"", out code);
+            }
+        }
+
+        private static bool IsGone(string full, bool isDir, bool keep)
+        {
+            if (!isDir) return !File.Exists(full);
+            if (!keep) return !Directory.Exists(full);
+            try { return Directory.GetFileSystemEntries(full).Length == 0; } catch { return false; }
+        }
+
+        private class Leftovers
+        {
+            public List<string> Files = new List<string>();
+            public List<string> Dirs = new List<string>();
+        }
+
+        private static Leftovers Remaining(string full, bool isDir, bool keep)
+        {
+            var r = new Leftovers();
+            if (!isDir)
+            {
+                if (File.Exists(full)) r.Files.Add(full);
+                return r;
+            }
+            if (!Directory.Exists(full)) return r;
+            var stack = new Stack<string>();
+            stack.Push(full);
+            while (stack.Count > 0)
+            {
+                string d = stack.Pop();
+                try { r.Files.AddRange(Directory.GetFiles(d)); } catch { }
+                try
+                {
+                    foreach (var s in Directory.GetDirectories(d))
+                    {
+                        r.Dirs.Add(s);
+                        bool link = false;
+                        try { link = (File.GetAttributes(s) & FileAttributes.ReparsePoint) != 0; } catch { }
+                        if (!link) stack.Push(s);
+                    }
+                }
+                catch { }
+            }
+            return r;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool MoveFileEx(string existing, string newName, int flags);
+
+        private static int ScheduleOnRestart(Leftovers r, string full, bool isDir, bool keep)
+        {
+            const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
+            int n = 0;
+            foreach (var f in r.Files)
+                if (MoveFileEx(@"\\?\" + f, null, MOVEFILE_DELAY_UNTIL_REBOOT)) n++;
+            // folders after their files, deepest first, so each one is empty by the time it's removed
+            foreach (var d in r.Dirs.OrderByDescending(x => x.Length))
+                if (MoveFileEx(@"\\?\" + d, null, MOVEFILE_DELAY_UNTIL_REBOOT)) n++;
+            if (isDir && !keep && MoveFileEx(@"\\?\" + full, null, MOVEFILE_DELAY_UNTIL_REBOOT)) n++;
+            return n;
+        }
+
+        private static void EnsureExplorer()
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                Thread.Sleep(250);
+                if (Process.GetProcessesByName("explorer").Length > 0) return;
+            }
+            try { Process.Start(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe")); } catch { }
+        }
+    }
+
+    /// Finds which programs have a file open, using the Windows Restart Manager (same as "file in use" dialogs).
+    static class Locker
+    {
+        public class Info { public int Pid; public string Name; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RM_UNIQUE_PROCESS
+        {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct RM_PROCESS_INFO
+        {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+            public int ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmEndSession(uint pSessionHandle);
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
+            uint nApplications, RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo,
+            [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+
+        private static readonly string[] Critical =
+        {
+            "System", "Idle", "Registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass",
+            "svchost", "MsMpEng", "dwm", "fontdrvhost", "Memory Compression", "StopProcessing"
+        };
+
+        public static bool IsCritical(string name)
+        {
+            return Critical.Any(c => name.Equals(c, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public static List<Info> Find(List<string> files)
+        {
+            var result = new List<Info>();
+            if (files == null || files.Count == 0) return result;
+            uint handle;
+            if (RmStartSession(out handle, 0, Guid.NewGuid().ToString()) != 0) return result;
+            try
+            {
+                if (RmRegisterResources(handle, (uint)files.Count, files.ToArray(), 0, null, 0, null) != 0) return result;
+                uint needed, count = 0, reasons = 0;
+                int rc = RmGetList(handle, out needed, ref count, null, ref reasons);
+                if (rc == 234 && needed > 0) // ERROR_MORE_DATA
+                {
+                    var infos = new RM_PROCESS_INFO[needed];
+                    count = needed;
+                    if (RmGetList(handle, out needed, ref count, infos, ref reasons) == 0)
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            int pid = infos[i].Process.dwProcessId;
+                            if (result.Any(x => x.Pid == pid)) continue;
+                            string name = infos[i].strAppName;
+                            try { using (var p = Process.GetProcessById(pid)) name = p.ProcessName; } catch { }
+                            result.Add(new Info { Pid = pid, Name = name });
+                        }
+                    }
+                }
+            }
+            finally { RmEndSession(handle); }
+            return result;
+        }
+    }
+
     class TitleBar : EdgePanel
     {
         private readonly MainForm owner;

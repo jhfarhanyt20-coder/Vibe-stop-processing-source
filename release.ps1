@@ -1,11 +1,15 @@
 # Publishes a new version of Vibe Stop Processing.
-# Rule: every release goes up by 0.1 automatically (2.1.0 -> 2.2.0 -> 2.3.0 ...).
+# Version rule:
+#   normal release  -> last number +1   (2.5.0 -> 2.5.1 -> 2.5.2 ...)
+#   -Minor          -> middle number +1 (2.5.2 -> 2.6.0)   for bigger feature updates
 # Usage:  .\release.ps1 -Notes "What changed in this version"
+#         .\release.ps1 -Minor -Notes "Big new feature"
 #         .\release.ps1 -BuildOnly      (build exe + installer locally, publish nothing)
 # Users with "Install updates automatically" on get it on their next app start.
 
 param(
     [string]$Notes = "",
+    [switch]$Minor,
     [switch]$BuildOnly
 )
 
@@ -23,8 +27,9 @@ $latest = $tags |
     Where-Object { $_ -match '^v(\d+)\.(\d+)\.(\d+)$' } |
     ForEach-Object { [version]($_.TrimStart('v')) } |
     Sort-Object -Descending | Select-Object -First 1
-if ($latest) { $Version = "{0}.{1}.0" -f $latest.Major, ($latest.Minor + 1) }
-else { $Version = "1.1.0" }
+if (-not $latest) { $Version = "1.0.0" }
+elseif ($Minor) { $Version = "{0}.{1}.0" -f $latest.Major, ($latest.Minor + 1) }          # big update: 2.5.3 -> 2.6.0
+else { $Version = "{0}.{1}.{2}" -f $latest.Major, $latest.Minor, ($latest.Build + 1) }   # normal:     2.5.0 -> 2.5.1
 Write-Host "Building v$Version (previous: v$latest)" -ForegroundColor Cyan
 
 # 1. stamp the version into the source (source is pure ASCII, so encoding can't break text)

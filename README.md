@@ -69,6 +69,8 @@ Running a newer installer over an existing install upgrades it in place.
 | **Disk Health** | Shows whether each HDD/SSD reports *Healthy*, and warns you to back up if it doesn't |
 | **Battery Report** | Opens Windows' detailed laptop battery report (capacity and wear) |
 
+**Delete Permanently (built-in unlocker):** erases a file or folder (e.g. `node_modules`) without the Recycle Bin, after a strong warning. It escalates step by step: normal delete with `\\?\` long-path support → take ownership + grant Administrators → find the programs locking the files (Restart Manager) and offer **Close & Delete** → **Delete on Restart** (`MoveFileEx`). Drives, Windows, Program Files and the main user folders are blocked.
+
 The **This PC** panel shows the Windows version, CPU, RAM use, uptime, and free space on every drive.
 
 ### 5. Runs quietly in the system tray

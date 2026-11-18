@@ -45,6 +45,15 @@ One click switches off everything in Windows that can power your PC back on: Fas
 | **Disk Health** | Shows whether each HDD/SSD is healthy |
 | **Battery Report** | Shows your laptop battery's real capacity and wear |
 
+#### 🗑️ Delete Permanently (built-in unlocker)
+Paste the path of any **file or folder** (for example a huge `node_modules`) and it's erased **without going to the Recycle Bin**, together with everything inside it. A strong warning appears first, because this can't be undone.
+It also deletes items that **won't delete normally**:
+- very long paths, read-only, hidden and oddly-named files,
+- **"Access denied"** items: it takes ownership and permission automatically,
+- files **in use** by another program: it shows which program is holding them, and you choose **Close & Delete** or **Delete on Restart**.
+
+Whole drives, Windows, Program Files and your main user folders are blocked for safety.
+
 There is also a **This PC** panel with your Windows version, CPU, RAM, uptime and free space on every drive.
 
 ### 5. Runs quietly in the system tray
