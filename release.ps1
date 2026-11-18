@@ -12,9 +12,14 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-# find the highest released version and add 0.1
+# Source code lives in the PRIVATE repo (git origin).
+# Users download from the PUBLIC repo, which only holds README, LICENSE and the releases.
+$PublicRepo = "jhfarhanyt20-coder/Vibe-stop-processing"
+
+# find the highest released version (public releases + local tags) and add 0.1
 git fetch --tags --quiet
-$latest = git tag --list "v*" |
+$tags = @(git tag --list "v*") + @(gh release list --repo $PublicRepo --limit 100 --json tagName --jq ".[].tagName")
+$latest = $tags |
     Where-Object { $_ -match '^v(\d+)\.(\d+)\.(\d+)$' } |
     ForEach-Object { [version]($_.TrimStart('v')) } |
     Sort-Object -Descending | Select-Object -First 1
@@ -51,7 +56,7 @@ $exe = Get-Item StopProcessing.exe
 $manifest = [ordered]@{
     version = $Version
     notes   = $Notes
-    url     = "https://github.com/jhfarhanyt20-coder/Vibe-stop-processing/releases/download/v$Version/StopProcessing.exe"
+    url     = "https://github.com/$PublicRepo/releases/download/v$Version/StopProcessing.exe"
     size    = $exe.Length
     sha256  = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
 }
@@ -60,12 +65,17 @@ $manifest = [ordered]@{
 Write-Host "Built StopProcessing.exe, $setup and dist\latest.json" -ForegroundColor Green
 if ($BuildOnly) { return }
 
-# 4. commit, push and publish the GitHub release
-#    - VibeStopProcessing-Setup-x.y.z.exe : for new users
-#    - StopProcessing.exe + latest.json   : used by the in-app auto updater
+# 5. commit + tag the source in the private repo
 git add -A
 git commit -m "Release v$Version"
+git tag "v$Version"
 git push
-gh release create "v$Version" $setup StopProcessing.exe dist\latest.json --title "Vibe Stop Processing v$Version" --notes $Notes
+git push origin "v$Version"
+
+# 6. publish the release on the PUBLIC repo (no source code there)
+#    - VibeStopProcessing-Setup-x.y.z.exe : for new users
+#    - StopProcessing.exe + latest.json   : used by the in-app auto updater
+gh release create "v$Version" $setup StopProcessing.exe dist\latest.json --repo $PublicRepo --target main `
+    --title "Vibe Stop Processing v$Version" --notes $Notes
 
 Write-Host "Released v$Version" -ForegroundColor Green

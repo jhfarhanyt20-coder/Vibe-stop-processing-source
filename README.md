@@ -96,6 +96,14 @@ The **This PC** panel shows the Windows version, CPU, RAM use, uptime, and free 
 
 ---
 
+## For the publisher: where things live
+| Repository | Visibility | Contents |
+|---|---|---|
+| `Vibe-stop-processing-source` | **Private** | All source code and history (this repo) |
+| `Vibe-stop-processing` | Public | README, LICENSE and releases only. Users download from here and the app updates from here |
+
+The public repo's README lives in `public/README.md`. Push changes to it by hand when needed.
+
 ## For the publisher: releasing an update
 The version goes up by **0.1 automatically** on every release (2.1.0 → 2.2.0 → 2.3.0). One command builds the app and the installer, pushes the code and creates the GitHub release:
 
