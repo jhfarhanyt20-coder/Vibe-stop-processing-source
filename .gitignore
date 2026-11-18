@@ -1,0 +1,7 @@
+*.pdb
+*.obj
+*.tmp
+bin/
+obj/
+.vs/
+.claude/
