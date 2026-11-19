@@ -22,17 +22,18 @@ Once it's installed, the app updates itself. You don't need to download new vers
 
 ### 1. Processes: stop everything before shutdown
 - Shows running processes live, with CPU, memory and a status for each one.
-- **Stop All Processes** closes apps one at a time and shows the progress.
+- **Stop All Processes** closes apps one at a time and shows the progress. Apps with a window get a moment to close cleanly, the rest are ended.
+- **Right-click** any process to stop just that one, stop all copies of it, or open its file location.
 - **Windows system processes are never touched.**
-- Important apps such as browsers, Office, Discord and Steam **ask before closing**, so you don't lose unsaved work.
+- **No questions asked:** everything you started (browsers, editors, `node`, `bun`, terminals...) is stopped one by one in a single click. Windows processes and services are never touched.
 - Optional **"Shut down PC when finished"**, with a 15-second cancel window.
 
 ### 2. Cleaner: delete junk files in one click
 Cleans user and Windows temp files, the thumbnail cache, crash dumps, **browser cache** (Chrome, Edge, Brave, Opera, Vivaldi and Firefox, with logins and history kept), and optionally the Windows Update cache, Prefetch data and the Recycle Bin.
-Files that are in use are skipped: you choose **Skip / Skip All / Stop**. At the end it shows how much space was freed.
+Files that are in use are skipped. You are asked once (Skip All / Stop), never per file. At the end it shows how much space was freed.
 
 ### 3. Power Fix: PC turns back on after shutdown
-One click switches off everything in Windows that can power your PC back on: Fast Startup, wake timers, devices allowed to wake the PC (network card, mouse, keyboard), maintenance wake-up, auto sign-in after updates, and restart on system failure.
+One click switches off everything in Windows that can power your PC back on: the network card's Wake-on-LAN (also from full shutdown), Fast Startup, wake timers, devices allowed to wake the PC (network card, mouse, keyboard), maintenance wake-up, auto sign-in after updates, and restart on system failure.
 **Restore Defaults** undoes all of it.
 
 ### 4. Tools: one-click fixes

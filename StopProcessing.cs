@@ -1104,10 +1104,41 @@ namespace StopProcessing
     /// Free space bars for every fixed drive.
     class DriveList : Control
     {
+        private class DriveData { public string Name; public long Total, Free; }
+        private List<DriveData> data = new List<DriveData>();
+        private volatile bool loading;
+
         public DriveList()
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        /// Reads drive sizes on a background thread: a sleeping hard disk can take seconds to answer.
+        public void Reload()
+        {
+            if (loading) return;
+            loading = true;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                var list = new List<DriveData>();
+                try
+                {
+                    foreach (var d in DriveInfo.GetDrives())
+                    {
+                        try
+                        {
+                            if (d.DriveType != DriveType.Fixed || !d.IsReady) continue;
+                            list.Add(new DriveData { Name = d.Name.TrimEnd('\\'), Total = d.TotalSize, Free = d.TotalFreeSpace });
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+                loading = false;
+                if (IsDisposed || !IsHandleCreated) return;
+                try { BeginInvoke(new Action(() => { data = list; Invalidate(); })); } catch { }
+            });
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1116,16 +1147,9 @@ namespace StopProcessing
             g.Clear(Theme.Card);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             int y = 4;
-            foreach (var d in DriveInfo.GetDrives())
+            foreach (var d in data)
             {
-                long total, free;
-                try
-                {
-                    if (d.DriveType != DriveType.Fixed || !d.IsReady) continue;
-                    total = d.TotalSize;
-                    free = d.TotalFreeSpace;
-                }
-                catch { continue; }
+                long total = d.Total, free = d.Free;
                 if (y + 40 > Height) break;
                 double used = total > 0 ? 1.0 - free / (double)total : 0;
                 Color c = used > 0.9 ? Theme.Red : used > 0.75 ? Theme.Amber : Theme.Blue;
@@ -1157,7 +1181,7 @@ namespace StopProcessing
             Glyph = glyph;
             Text = title;
             Desc = desc;
-            Height = 54;
+            Height = 50;
             Dock = DockStyle.Top;
         }
 
@@ -1189,8 +1213,8 @@ namespace StopProcessing
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             int textW = pill.X - 64 - 12;
-            TextRenderer.DrawText(g, Text, Theme.Semi(10f), new Rectangle(64, 8, textW, 20), Theme.Text, tf);
-            TextRenderer.DrawText(g, Desc, Theme.F(8.5f), new Rectangle(64, 29, textW, 18), Theme.Faint, tf);
+            TextRenderer.DrawText(g, Text, Theme.Semi(10f), new Rectangle(64, 6, textW, 20), Theme.Text, tf);
+            TextRenderer.DrawText(g, Desc, Theme.F(8.5f), new Rectangle(64, 26, textW, 18), Theme.Faint, tf);
 
             using (var pen = new Pen(Color.FromArgb(37, 41, 49)))
                 g.DrawLine(pen, 14, Height - 1, Width - 14, Height - 1);
@@ -1326,7 +1350,7 @@ namespace StopProcessing
 
         // power page
         private PageHeader powerHeader;
-        private StatusRow rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowAutoReboot, rowArso;
+        private StatusRow rowNicWake, rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowAutoReboot, rowArso;
         private FlatButton fixButton, restoreButton, recheckButton, fullShutdownButton;
         private ListBox powerLog;
         private volatile bool isPowerBusy;
@@ -1747,7 +1771,7 @@ namespace StopProcessing
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 116F));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            procHeader = new PageHeader("Processes", "Live process monitor \u2014 pick what stays, stop the rest.") { Dock = DockStyle.Fill };
+            procHeader = new PageHeader("Processes", "Live process monitor \u2014 right-click a process to stop just that one.") { Dock = DockStyle.Fill };
 
             var stats = Table(4, 1, Theme.Bg);
             for (int i = 0; i < 4; i++) stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25F));
@@ -1843,6 +1867,7 @@ namespace StopProcessing
             catch { }
 
             grid.CellPainting += Grid_CellPainting;
+            BuildProcessMenu();
             grid.HandleCreated += (s, e) =>
             {
                 foreach (Control c in grid.Controls)
@@ -1898,14 +1923,14 @@ namespace StopProcessing
             var card = new Card { Dock = DockStyle.Fill, Padding = new Padding(20, 18, 20, 18) };
             var t = Table(1, 8, Theme.Card);
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
-            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 58F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 76F));
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 22F));
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
             t.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            var desc = MakeLabel("Closes every non-system app one by one. Windows processes are never touched and important apps ask first.",
+            var desc = MakeLabel("One click stops every app you started (browsers, node, bun, terminals...) one by one, without asking. Windows processes are never touched. Right-click a process to stop just that one.",
                 Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
             desc.AutoEllipsis = false;
 
@@ -1930,77 +1955,154 @@ namespace StopProcessing
             return card;
         }
 
+        // ---- process list: collected on a background thread so the window never freezes
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr h);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(IntPtr h, int flags, System.Text.StringBuilder name, ref int size);
+
+        private readonly object snapshotLock = new object();
+        private readonly Dictionary<int, string> pathCache = new Dictionary<int, string>();
+        private static readonly int mySession = Process.GetCurrentProcess().SessionId;
+        private static readonly int myPid = Process.GetCurrentProcess().Id;
+        private volatile bool refreshing;
+        private ContextMenuStrip procMenu;
+
+        private class Snapshot
+        {
+            public List<ProcRow> Rows = new List<ProcRow>();
+            public int Total, Stoppable;
+            public long Memory;
+            public double Cpu;
+        }
+
+        /// Fast, exception-free way to get a process's exe path (works for most elevated processes too).
+        private static string ExePath(int pid)
+        {
+            IntPtr h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+            if (h == IntPtr.Zero) return "";
+            try
+            {
+                var sb = new System.Text.StringBuilder(1024);
+                int size = sb.Capacity;
+                return QueryFullProcessImageName(h, 0, sb, ref size) ? sb.ToString() : "";
+            }
+            finally { CloseHandle(h); }
+        }
+
         private void StartTimer()
         {
-            refreshTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            refreshTimer = new System.Windows.Forms.Timer { Interval = 2000 };
             refreshTimer.Tick += (s, e) =>
             {
-                if (!isStopping && currentPage == 0 && WindowState != FormWindowState.Minimized) RefreshGrid();
+                if (!isStopping && currentPage == 0 && Visible && WindowState != FormWindowState.Minimized) RefreshGrid();
             };
             refreshTimer.Start();
             RefreshGrid();
         }
 
+        /// Starts a background refresh of the process list (ignored if one is already running).
         private void RefreshGrid()
         {
-            var rows = new List<ProcRow>();
-            int totalProc = 0, stoppable = 0;
-            long totalMem = 0;
-            double totalCpu = 0;
-            var alive = new HashSet<int>();
-
-            foreach (var p in Process.GetProcesses())
+            if (refreshing) return;
+            refreshing = true;
+            ThreadPool.QueueUserWorkItem(_ =>
             {
-                try
-                {
-                    totalProc++;
-                    long mem = 0;
-                    string path = string.Empty;
-                    try { mem = p.WorkingSet64; } catch { }
-                    try { path = p.MainModule.FileName; } catch { }
-                    double cpu = SampleCpu(p);
-                    alive.Add(p.Id);
-                    totalMem += mem;
-                    totalCpu += cpu;
-                    var row = new ProcRow { Pid = p.Id, Name = p.ProcessName, Memory = mem, Cpu = cpu, Role = RoleOf(p.ProcessName, path) };
-                    if (row.Role != "SYSTEM PROTECTED") stoppable++;
-                    rows.Add(row);
-                }
+                Snapshot snap = null;
+                try { snap = TakeSnapshot(); }
                 catch { }
-                finally { p.Dispose(); }
-            }
+                Ui(() =>
+                {
+                    try { if (snap != null) ApplySnapshot(snap); }
+                    finally { refreshing = false; }
+                });
+                if (IsDisposed) refreshing = false;
+            });
+        }
 
-            foreach (var dead in lastSample.Keys.Where(k => !alive.Contains(k)).ToList()) lastSample.Remove(dead);
-
-            rows = rows.OrderByDescending(r => r.Memory).ToList();
-
-            int selectedPid = -1;
-            if (grid.CurrentRow != null) int.TryParse(Convert.ToString(grid.CurrentRow.Cells["PID"].Value), out selectedPid);
-            int scroll = grid.FirstDisplayedScrollingRowIndex >= 0 ? grid.FirstDisplayedScrollingRowIndex : 0;
-
-            grid.SuspendLayout();
-            grid.Rows.Clear();
-            int reselect = -1;
-            foreach (var r in rows)
+        private Snapshot TakeSnapshot()
+        {
+            lock (snapshotLock)
             {
-                int idx = grid.Rows.Add(r.Name, r.Pid.ToString(), r.Cpu.ToString("0.0"), Theme.FormatBytes(r.Memory), r.Role);
-                if (r.Pid == selectedPid) reselect = idx;
-                if (r.Role == "SYSTEM PROTECTED") grid.Rows[idx].DefaultCellStyle.ForeColor = Theme.Muted;
+                var snap = new Snapshot();
+                var alive = new HashSet<int>();
+                foreach (var p in Process.GetProcesses())
+                {
+                    try
+                    {
+                        int pid = p.Id;
+                        alive.Add(pid);
+                        snap.Total++;
+                        long mem = 0;
+                        int session = -1;
+                        try { mem = p.WorkingSet64; } catch { }
+                        try { session = p.SessionId; } catch { }
+                        string path;
+                        if (!pathCache.TryGetValue(pid, out path)) { path = ExePath(pid); pathCache[pid] = path; }
+                        double cpu = SampleCpu(p);
+                        snap.Memory += mem;
+                        snap.Cpu += cpu;
+                        var row = new ProcRow { Pid = pid, Name = p.ProcessName, Memory = mem, Cpu = cpu, Path = path, Session = session };
+                        row.Role = IsProtected(row) ? "SYSTEM PROTECTED" : "normal";
+                        if (row.Role != "SYSTEM PROTECTED") snap.Stoppable++;
+                        snap.Rows.Add(row);
+                    }
+                    catch { }
+                    finally { p.Dispose(); }
+                }
+                foreach (var dead in lastSample.Keys.Where(k => !alive.Contains(k)).ToList()) lastSample.Remove(dead);
+                foreach (var dead in pathCache.Keys.Where(k => !alive.Contains(k)).ToList()) pathCache.Remove(dead);
+                snap.Rows = snap.Rows.OrderByDescending(r => r.Memory).ToList();
+                return snap;
             }
-            grid.ResumeLayout();
+        }
 
-            try
+        /// Updates the grid in place (no clearing), so it doesn't flicker or lose the selection.
+        private void ApplySnapshot(Snapshot snap)
+        {
+            int selectedPid = -1;
+            if (grid.SelectedRows.Count > 0 && grid.SelectedRows[0].Tag is int) selectedPid = (int)grid.SelectedRows[0].Tag;
+
+            int n = snap.Rows.Count;
+            if (grid.Rows.Count < n) grid.Rows.Add(n - grid.Rows.Count);
+            while (grid.Rows.Count > n) grid.Rows.RemoveAt(grid.Rows.Count - 1);
+
+            int reselect = -1;
+            for (int i = 0; i < n; i++)
+            {
+                var r = snap.Rows[i];
+                var row = grid.Rows[i];
+                row.Tag = r.Pid;
+                SetCell(row, 0, r.Name);
+                SetCell(row, 1, r.Pid.ToString());
+                SetCell(row, 2, r.Cpu.ToString("0.0"));
+                SetCell(row, 3, Theme.FormatBytes(r.Memory));
+                SetCell(row, 4, r.Role);
+                Color fc = r.Role == "SYSTEM PROTECTED" ? Theme.Muted : Theme.Soft;
+                if (row.DefaultCellStyle.ForeColor != fc) row.DefaultCellStyle.ForeColor = fc;
+                if (r.Pid == selectedPid) reselect = i;
+            }
+            if (reselect >= 0 && !grid.Rows[reselect].Selected)
             {
                 grid.ClearSelection();
-                if (reselect >= 0) grid.Rows[reselect].Selected = true;
-                if (scroll > 0 && scroll < grid.Rows.Count) grid.FirstDisplayedScrollingRowIndex = scroll;
+                grid.Rows[reselect].Selected = true;
             }
-            catch { }
+            else if (reselect < 0 && grid.SelectedRows.Count > 0) grid.ClearSelection();
 
-            statProc.Value = totalProc.ToString();
-            statCpu.Value = Math.Min(100, totalCpu).ToString("0") + " %";
-            statMem.Value = Theme.FormatBytes(totalMem);
-            statStoppable.Value = stoppable.ToString();
+            statProc.Value = snap.Total.ToString();
+            statCpu.Value = Math.Min(100, snap.Cpu).ToString("0") + " %";
+            statMem.Value = Theme.FormatBytes(snap.Memory);
+            statStoppable.Value = snap.Stoppable.ToString();
+        }
+
+        private static void SetCell(DataGridViewRow row, int col, string value)
+        {
+            if (!string.Equals(row.Cells[col].Value as string, value)) row.Cells[col].Value = value;
         }
 
         private double SampleCpu(Process p)
@@ -2022,54 +2124,131 @@ namespace StopProcessing
             catch { return 0; }
         }
 
-        private string RoleOf(string name, string path)
+        /// Windows itself, services (session 0), other users' sessions and this app are never stopped.
+        private bool IsProtected(ProcRow r)
         {
-            if (IsCritical(name, path)) return "SYSTEM PROTECTED";
-            if (IMPORTANT.Any(i => name.Equals(i, StringComparison.OrdinalIgnoreCase))) return "CONFIRM";
-            return "normal";
+            if (r.Pid <= 4 || r.Pid == myPid) return true;
+            if (r.Session != mySession) return true;
+            return IsCritical(r.Name, r.Path);
         }
+
+        /// Programs that live in the Windows folder but are tools the user opened (terminals, editors...),
+        /// so Stop All may close them.
+        private static readonly string[] USER_TOOLS = new string[]
+        {
+            "cmd", "powershell", "pwsh", "powershell_ise", "WindowsTerminal", "OpenConsole", "wt", "wsl", "bash",
+            "notepad", "mspaint", "write", "wordpad", "calc", "CalculatorApp", "ping", "tracert", "nslookup",
+            "regedit", "mstsc", "SnippingTool", "charmap", "magnify", "osk", "xcopy", "robocopy", "timeout", "choice"
+        };
 
         private bool IsCritical(string name, string path)
         {
             if (name.Equals("StopProcessing", StringComparison.OrdinalIgnoreCase)) return true;
             if (CRITICAL.Any(c => name.Equals(c, StringComparison.OrdinalIgnoreCase))) return true;
+            if (USER_TOOLS.Any(c => name.Equals(c, StringComparison.OrdinalIgnoreCase))) return false;
             if (!string.IsNullOrEmpty(path))
             {
                 string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-                if (path.StartsWith(win, StringComparison.OrdinalIgnoreCase)) return true;
+                if (path.StartsWith(win + "\\", StringComparison.OrdinalIgnoreCase)) return true;
             }
             return false;
         }
 
+        // ---- right-click menu on a process
+
+        private void BuildProcessMenu()
+        {
+            procMenu = new ContextMenuStrip
+            {
+                Renderer = new DarkMenuRenderer(),
+                Font = Theme.F(9.5f),
+                ShowImageMargin = false,
+                BackColor = Theme.Surface,
+                ForeColor = Theme.Text,
+                Padding = new Padding(2, 4, 2, 4)
+            };
+            grid.CellMouseDown += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right || e.RowIndex < 0) return;
+                grid.ClearSelection();
+                grid.Rows[e.RowIndex].Selected = true;
+                ShowProcessMenu(grid.Rows[e.RowIndex]);
+            };
+        }
+
+        private void ShowProcessMenu(DataGridViewRow row)
+        {
+            if (!(row.Tag is int)) return;
+            int pid = (int)row.Tag;
+            string name = Convert.ToString(row.Cells[0].Value);
+            bool prot = Convert.ToString(row.Cells[4].Value) == "SYSTEM PROTECTED";
+            string path;
+            if (!pathCache.TryGetValue(pid, out path)) path = ExePath(pid);
+
+            procMenu.Items.Clear();
+            var head = new ToolStripMenuItem(name + "  (PID " + pid + ")") { Enabled = false, Padding = new Padding(8, 5, 8, 5) };
+            procMenu.Items.Add(head);
+            procMenu.Items.Add(new ToolStripSeparator());
+            if (prot)
+            {
+                procMenu.Items.Add(new ToolStripMenuItem("Protected \u2014 Windows process") { Enabled = false, Padding = new Padding(8, 5, 8, 5) });
+            }
+            else
+            {
+                var stop = new ToolStripMenuItem("Stop this process", null, (s, e) => StopPids(new List<int> { pid }, name))
+                { Padding = new Padding(8, 5, 8, 5), ForeColor = Theme.Red };
+                procMenu.Items.Add(stop);
+                int same = grid.Rows.Cast<DataGridViewRow>().Count(r =>
+                    Convert.ToString(r.Cells[0].Value) == name && Convert.ToString(r.Cells[4].Value) != "SYSTEM PROTECTED");
+                if (same > 1)
+                {
+                    procMenu.Items.Add(new ToolStripMenuItem("Stop all \"" + name + "\" (" + same + ")", null, (s, e) =>
+                    {
+                        var pids = grid.Rows.Cast<DataGridViewRow>()
+                            .Where(r => Convert.ToString(r.Cells[0].Value) == name && Convert.ToString(r.Cells[4].Value) != "SYSTEM PROTECTED" && r.Tag is int)
+                            .Select(r => (int)r.Tag).ToList();
+                        StopPids(pids, name);
+                    }) { Padding = new Padding(8, 5, 8, 5), ForeColor = Theme.Red });
+                }
+            }
+            if (!string.IsNullOrEmpty(path))
+            {
+                procMenu.Items.Add(new ToolStripSeparator());
+                procMenu.Items.Add(new ToolStripMenuItem("Open file location", null, (s, e) =>
+                {
+                    try { Process.Start("explorer.exe", "/select,\"" + path + "\""); } catch { }
+                }) { Padding = new Padding(8, 5, 8, 5) });
+            }
+            procMenu.Show(Cursor.Position);
+        }
+
+        private void StopPids(List<int> pids, string name)
+        {
+            var th = new Thread(() =>
+            {
+                foreach (var pid in pids)
+                {
+                    string r = StopOne(pid);
+                    int p = pid;
+                    Ui(() => AddLog(stopLog, name + " (" + p + ") \u2192 " + r));
+                }
+                Ui(RefreshGrid);
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        // ---- Stop All: one by one, no questions; Windows processes are never touched
+
         private void StopButton_Click(object sender, EventArgs e)
         {
             if (isStopping) return;
-            RefreshGrid();
-
-            var targets = new List<ProcRow>();
-            foreach (DataGridViewRow row in grid.Rows)
-            {
-                string role = Convert.ToString(row.Cells["Role"].Value);
-                if (role == "SYSTEM PROTECTED") continue;
-                int pid;
-                if (!int.TryParse(Convert.ToString(row.Cells["PID"].Value), out pid)) continue;
-                targets.Add(new ProcRow { Pid = pid, Name = Convert.ToString(row.Cells["Process"].Value), Role = role });
-            }
-
-            int ans = ThemedDialog.Show(this, "Stop all processes?",
-                "This will stop " + targets.Count + " processes one by one.\n\n" +
-                "Windows system processes are never touched, and you'll be asked before any important app is closed." +
-                (shutdownAfter.Checked ? "\n\nThe PC will shut down when the run is finished." : ""),
-                new[] { "Stop " + targets.Count + " processes", "Cancel" }, 0, Theme.Red);
-            if (ans != 0) return;
-
             isStopping = true;
             stopButton.Enabled = false;
             stopButton.Text = "Stopping\u2026";
-            stopProgress.Maximum = Math.Max(1, targets.Count);
             stopProgress.Value = 0;
             stopLog.Items.Clear();
-            AddLog(stopLog, "Queued " + targets.Count + " processes.");
+            AddLog(stopLog, "Collecting running apps\u2026");
 
             stopCancel = new CancellationTokenSource();
             var token = stopCancel.Token;
@@ -2077,22 +2256,30 @@ namespace StopProcessing
 
             var worker = new Thread(() =>
             {
+                var targets = TakeSnapshot().Rows.Where(r => r.Role != "SYSTEM PROTECTED").ToList();
+                int total = targets.Count;
+                Ui(() =>
+                {
+                    stopProgress.Maximum = Math.Max(1, total);
+                    AddLog(stopLog, "Stopping " + total + " processes.");
+                });
+
                 int done = 0, ok = 0;
                 foreach (var t in targets)
                 {
                     if (token.IsCancellationRequested) break;
                     done++;
-                    string result = StopOne(t);
-                    if (result == "Stopped") ok++;
+                    string result = StopOne(t.Pid);
+                    if (result == "Stopped" || result == "Closed") ok++;
                     int d = done;
                     string r = result, nm = t.Name;
                     Ui(() =>
                     {
                         stopProgress.Value = d;
-                        procHeader.Subtitle = nm + " \u2014 " + r + "   (" + d + " / " + targets.Count + ")";
+                        procHeader.Subtitle = nm + " \u2014 " + r + "   (" + d + " / " + total + ")";
                         AddLog(stopLog, nm + " \u2192 " + r);
                     });
-                    Thread.Sleep(200);
+                    Thread.Sleep(60);
                 }
 
                 int stopped = ok;
@@ -2101,8 +2288,8 @@ namespace StopProcessing
                     isStopping = false;
                     stopButton.Enabled = true;
                     stopButton.Text = "Stop All Processes";
-                    procHeader.Subtitle = "Finished. Stopped " + stopped + " of " + targets.Count + " processes.";
-                    AddLog(stopLog, "Finished. " + stopped + "/" + targets.Count + " stopped.");
+                    procHeader.Subtitle = "Finished. Stopped " + stopped + " of " + total + " processes.";
+                    AddLog(stopLog, "Finished. " + stopped + "/" + total + " stopped.");
                     RefreshGrid();
                     if (shutdownWhenDone && !token.IsCancellationRequested) ShutdownCountdown();
                 });
@@ -2111,39 +2298,32 @@ namespace StopProcessing
             worker.Start();
         }
 
-        private string StopOne(ProcRow t)
+        /// Closes a window app gracefully if it can, otherwise ends it. Never asks.
+        private string StopOne(int pid)
         {
             Process p;
-            try { p = Process.GetProcessById(t.Pid); }
+            try { p = Process.GetProcessById(pid); }
             catch { return "Already closed"; }
 
             try
             {
-                string path = string.Empty;
-                try { path = p.MainModule.FileName; } catch { }
-                if (IsCritical(p.ProcessName, path)) return "Protected";
+                var row = new ProcRow { Pid = pid, Name = p.ProcessName, Path = ExePath(pid) };
+                try { row.Session = p.SessionId; } catch { row.Session = -1; }
+                if (IsProtected(row)) return "Protected";
 
-                string name = p.ProcessName;
-                if (t.Role == "CONFIRM")
+                IntPtr win = IntPtr.Zero;
+                try { win = p.MainWindowHandle; } catch { }
+                if (win != IntPtr.Zero)
                 {
-                    int a = AskOnUi("Close " + name + "?",
-                        "\"" + name + "\" looks like an important app. Unsaved work in it may be lost.",
-                        new[] { "Close it", "Keep running" }, 0, Theme.Amber);
-                    if (a != 0) return "Skipped";
+                    try { p.CloseMainWindow(); } catch { }
+                    if (p.WaitForExit(1200)) return "Closed";
                 }
-
-                p.CloseMainWindow();
-                if (!p.WaitForExit(1500))
-                {
-                    int a = AskOnUi("Force stop " + name + "?",
-                        "\"" + name + "\" did not close on its own.",
-                        new[] { "Force stop", "Leave running" }, 0, Theme.Red);
-                    if (a != 0) return "Left running";
-                    p.Kill();
-                    p.WaitForExit(1500);
-                }
+                p.Kill();
+                p.WaitForExit(2000);
                 return "Stopped";
             }
+            catch (InvalidOperationException) { return "Already closed"; }
+            catch (Win32Exception) { return "Access denied"; }
             catch (Exception ex)
             {
                 string m = ex.Message;
@@ -2156,7 +2336,7 @@ namespace StopProcessing
         private void ShutdownCountdown()
         {
             int code;
-            Native.Run("shutdown.exe", "/s /t 15", out code);
+            Native.Run("shutdown.exe", "/s /f /t 15", out code);
             int a = ThemedDialog.Show(this, "Shutting down",
                 "Your PC will shut down in 15 seconds.",
                 new[] { "Cancel shutdown", "OK" }, 1, Theme.Red);
@@ -2320,7 +2500,7 @@ namespace StopProcessing
             scanButton.SetColor(Theme.Secondary);
             scanButton.Click += (s, e) => StartScan();
 
-            askLocked = new CheckToggle { Text = "Ask me before skipping locked files", Dock = DockStyle.Fill, Checked = true };
+            askLocked = new CheckToggle { Text = "Ask once before skipping locked files", Dock = DockStyle.Fill, Checked = true };
 
             cleanProgress = new SlimBar { Dock = DockStyle.Fill };
             cleanSummary = MakeLabel("", Theme.F(9f), Theme.Soft, ContentAlignment.MiddleLeft);
@@ -2531,12 +2711,14 @@ namespace StopProcessing
                                 Ui(() => AddLog(cleanLog, "Skipped (in use): " + shortName));
                                 if (!skipAll)
                                 {
-                                    int a = AskOnUi("File in use \u2014 skip it?",
-                                        "This file is open in another program or protected, so it can't be deleted right now:\n\n" +
-                                        f + "\n\n" + ex.Message,
-                                        new[] { "Skip", "Skip All", "Stop Cleaning" }, 1, Theme.Blue);
-                                    if (a == 1) skipAll = true;
-                                    else if (a == 2 || a == -1) stop = true;
+                                    // asked only once per clean: every other locked file is skipped automatically
+                                    int a = AskOnUi("Some files can't be deleted",
+                                        "Some files are open in other programs or protected, so they can't be deleted right now.\n\n" +
+                                        "First one: " + f + "\n\n" +
+                                        "Skip all of them and keep cleaning the rest?",
+                                        new[] { "Skip All", "Stop Cleaning" }, 0, Theme.Blue);
+                                    if (a == 0) skipAll = true;
+                                    else stop = true;
                                 }
                             }
 
@@ -2642,6 +2824,8 @@ namespace StopProcessing
 
             var checksCard = new Card { Dock = DockStyle.Fill, Padding = new Padding(8, 14, 8, 8), Margin = new Padding(0, 0, 0, 14) };
             var checksHost = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Card, AutoScroll = true };
+            rowNicWake = new StatusRow("\uE839", "Network card can power the PC on",
+                "Wake-on-LAN keeps the network card awake after shutdown and turns the PC back on");
             rowFastStartup = new StatusRow("\uE945", "Fast Startup",
                 "Hybrid shutdown \u2014 the PC only half shuts down and can wake back up");
             rowWakeTimers = new StatusRow("\uE823", "Wake timers",
@@ -2654,7 +2838,7 @@ namespace StopProcessing
                 "Windows restarts and signs in by itself to finish updates");
             rowAutoReboot = new StatusRow("\uE777", "Restart on system failure",
                 "If shutdown crashes, Windows reboots instead of staying off");
-            var rows = new[] { rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowArso, rowAutoReboot };
+            var rows = new[] { rowNicWake, rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowArso, rowAutoReboot };
             for (int i = rows.Length - 1; i >= 0; i--) checksHost.Controls.Add(rows[i]);
             checksCard.Controls.Add(checksHost);
             checksCard.Controls.Add(new Label
@@ -2789,10 +2973,51 @@ namespace StopProcessing
             return ac != 0 || dc != 0;
         }
 
+        // ---- Wake-on-LAN: the network card stays powered after shutdown and can switch the PC back on.
+        //      powercfg only controls waking from Sleep, so the adapter's own settings must be turned off too.
+        private const string NicKeywords =
+            "@('*WakeOnMagicPacket','*WakeOnPattern','S5WakeOnLan','WakeOnLink','*ModernStandbyWoLMagicPacket','WakeFromS5','WolShutdownWake')";
+
+        private static string RunPs(string script)
+        {
+            int code;
+            return Native.Run("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + script + "\"", out code);
+        }
+
+        /// "adapter|keyword" -> value ("0" = off)
+        private static Dictionary<string, string> NicWakeSettings()
+        {
+            var d = new Dictionary<string, string>();
+            string o = RunPs("$k=" + NicKeywords + "; Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { $n=$_.Name; " +
+                             "Get-NetAdapterAdvancedProperty -Name $n -AllProperties -ErrorAction SilentlyContinue | " +
+                             "Where-Object { $k -contains $_.RegistryKeyword } | ForEach-Object { $n + '|' + $_.RegistryKeyword + '|' + ($_.RegistryValue -join '') } }");
+            foreach (var line in o.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var p = line.Split('|');
+                if (p.Length == 3) d[p[0] + "|" + p[1]] = p[2].Trim();
+            }
+            return d;
+        }
+
+        private static List<string> SetNicWake(bool on)
+        {
+            string v = on ? "1" : "0";
+            string o = RunPs("$k=" + NicKeywords + "; Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { $n=$_.Name; $c=$false; " +
+                             "Get-NetAdapterAdvancedProperty -Name $n -AllProperties -ErrorAction SilentlyContinue | " +
+                             "Where-Object { $k -contains $_.RegistryKeyword -and ($_.RegistryValue -join '') -ne '" + v + "' } | ForEach-Object { " +
+                             "Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $_.RegistryKeyword -RegistryValue " + v + " -NoRestart -ErrorAction SilentlyContinue; " +
+                             "$c=$true; 'OK|' + $n + ': ' + $_.DisplayName }; if ($c) { Restart-NetAdapter -Name $n -ErrorAction SilentlyContinue } }");
+            var log = new List<string>();
+            foreach (var line in o.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                if (line.StartsWith("OK|")) log.Add("\u2713 " + line.Substring(3) + (on ? " \u2192 on" : " \u2192 off"));
+            if (log.Count == 0) log.Add("Network card wake settings were already " + (on ? "on." : "off."));
+            return log;
+        }
+
         private void CheckPowerAsync()
         {
             if (isPowerBusy) return;
-            foreach (var r in new[] { rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowArso, rowAutoReboot })
+            foreach (var r in new[] { rowNicWake, rowFastStartup, rowWakeTimers, rowWakeDevices, rowMaintenance, rowArso, rowAutoReboot })
                 r.SetState(CheckState2.Unknown, "Checking\u2026");
 
             var th = new Thread(() =>
@@ -2803,10 +3028,16 @@ namespace StopProcessing
                 int? maint = ReadDword(KeyMaint, "WakeUp");
                 int? arso = ReadDword(KeyArso, "DisableAutomaticRestartSignOn");
                 int? reboot = ReadDword(KeyCrash, "AutoReboot");
+                var nic = NicWakeSettings();
 
                 Ui(() =>
                 {
                     int risks = 0;
+                    int nicOn = nic.Count(x => x.Value != "0");
+                    if (nic.Count == 0) rowNicWake.SetState(CheckState2.Ok, "Not supported");
+                    else if (nicOn == 0) rowNicWake.SetState(CheckState2.Ok, "Off");
+                    else { rowNicWake.SetState(CheckState2.Risk, "On"); risks++; }
+
                     if (hiber.HasValue && hiber.Value == 0) rowFastStartup.SetState(CheckState2.Ok, "Off");
                     else { rowFastStartup.SetState(CheckState2.Risk, "On"); risks++; }
 
@@ -2854,11 +3085,13 @@ namespace StopProcessing
             {
                 int a = ThemedDialog.Show(this, "Fix auto power-on?",
                     "This will:\n" +
+                    "\u2022  stop the network card from powering the PC on after shutdown (Wake-on-LAN)\n" +
                     "\u2022  turn off Fast Startup (shutdown becomes a real, full shutdown)\n" +
                     "\u2022  disable wake timers\n" +
                     "\u2022  stop the network card, mouse and keyboard from waking the PC\n" +
                     "\u2022  turn off maintenance wake-up and auto sign-in after updates\n" +
                     "\u2022  stay off instead of rebooting after a crash\n\n" +
+                    "Your internet will drop for a few seconds while the network card restarts.\n" +
                     "Note: you won't be able to wake the PC from Sleep with the mouse or keyboard \u2014 use the power button. " +
                     "You can undo everything with \"Restore Defaults\".",
                     new[] { "Apply Fix", "Cancel" }, 0, Theme.Blue);
@@ -2916,6 +3149,7 @@ namespace StopProcessing
                         Step(log, "Maintenance wake-up \u2192 off", () => WriteDword(KeyMaint, "WakeUp", 0));
                         Step(log, "Auto sign-in after updates \u2192 off", () => WriteDword(KeyArso, "DisableAutomaticRestartSignOn", 1));
                         Step(log, "Restart on system failure \u2192 off", () => WriteDword(KeyCrash, "AutoReboot", 0));
+                        foreach (var line in SetNicWake(false)) log(line);
                         log("Done. Use \"Full Shut Down\" for a clean power-off.");
                     }
                     else
@@ -2940,6 +3174,7 @@ namespace StopProcessing
                         Step(log, "Maintenance wake-up \u2192 on", () => WriteDword(KeyMaint, "WakeUp", 1));
                         Step(log, "Auto sign-in after updates \u2192 default", () => DeleteValue(KeyArso, "DisableAutomaticRestartSignOn"));
                         Step(log, "Restart on system failure \u2192 on", () => WriteDword(KeyCrash, "AutoReboot", 1));
+                        foreach (var line in SetNicWake(true)) log(line);
                         log("Defaults restored.");
                     }
                 }
@@ -2970,7 +3205,7 @@ namespace StopProcessing
                 new[] { "Shut Down", "Cancel" }, 0, Theme.Red);
             if (a != 0) return;
             int code;
-            Native.Run("shutdown.exe", "/s /t 0", out code);
+            Native.Run("shutdown.exe", "/s /f /t 0", out code);
         }
 
         // =================================================================
@@ -3116,7 +3351,7 @@ namespace StopProcessing
                           "RAM  " + Theme.FormatBytes((long)(m.ullTotalPhys - m.ullAvailPhys)) + " used of " + Theme.FormatBytes((long)m.ullTotalPhys) +
                           " (" + m.dwMemoryLoad + "%)\n" +
                           "Up for  " + upText + (up.TotalDays >= 3 ? "  \u2014 a restart would help" : "");
-            drives.Invalidate();
+            drives.Reload();
         }
 
         /// Runs a tool on a background thread, logging what it says. Only one tool runs at a time.
@@ -3652,6 +3887,8 @@ namespace StopProcessing
             public long Memory;
             public double Cpu;
             public string Role;
+            public string Path;
+            public int Session;
         }
 
         private static Mutex singleInstance;

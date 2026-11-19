@@ -22,10 +22,10 @@ Running a newer installer over an existing install upgrades it in place.
 
 ### 1. Processes: stop everything before shutdown
 - Shows running processes live, with CPU, memory and a status for each one.
-- **Stop All Processes** closes apps one at a time and shows the progress.
+- **Stop All Processes** closes apps one at a time and shows the progress. Apps with a window get a moment to close cleanly, the rest are ended.
+- **Right-click** any process to stop just that one, stop all copies of it, or open its file location.
 - **Windows system processes are never touched.** That covers `explorer`, `svchost`, `lsass`, Defender, drivers and anything in `C:\Windows`.
-- Important apps such as browsers, Office, Discord and Steam **ask before closing**, so you don't lose unsaved work.
-- If an app doesn't close on its own, the app asks whether to force-stop it.
+- **No questions asked:** everything you started (browsers, editors, `node`, `bun`, terminals...) is stopped one by one in a single click. Windows processes and services are never touched.
 - Optional **"Shut down PC when finished"**: the PC powers off 15 seconds after the run, and you can cancel it in that time.
 
 ### 2. Cleaner: delete temp files in one click
@@ -41,12 +41,13 @@ Running a newer installer over an existing install upgrades it in place.
 | Recycle Bin | ⬜ |
 
 - **Clean Now** deletes everything in the ticked locations.
-- **Files that are in use are skipped.** A dialog asks **Skip / Skip All / Stop Cleaning**. You can also untick *"Ask me before skipping locked files"* to skip them silently.
+- **Files that are in use are skipped.** You are asked **once** (Skip All / Stop), then every locked file is skipped automatically. Untick *"Ask once before skipping locked files"* to never be asked.
 - At the end it shows how much space was freed, how many files were deleted and how many were skipped.
 
 ### 3. Power Fix: PC turns back on after shutdown
 | Cause | What the fix does |
 |---|---|
+| **Network card Wake-on-LAN** (incl. the hidden "Shutdown Wake-On-LAN") | Turns it off. This is the most common reason a PC switches itself back on right after shutdown |
 | Fast Startup (hybrid shutdown) | Turns it off, so shutdown becomes a real full shutdown |
 | Wake timers | Disables them |
 | Devices allowed to wake the PC (network card / Wake-on-LAN, mouse, keyboard) | Disables wake for each device |
