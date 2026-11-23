@@ -59,10 +59,13 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags
 [UninstallRun]
 ; remove the "start with Windows" task the app created
 Filename: "{sys}\schtasks.exe"; Parameters: "/delete /tn ""VibeStopProcessing_{username}"" /f"; Flags: runhidden; RunOnceId: "RemoveStartupTask"
+; ...and the ones made by any other user of this PC
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -Command ""Get-ScheduledTask -TaskName 'VibeStopProcessing_*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false"""; Flags: runhidden; RunOnceId: "RemoveAllStartupTasks"
 ; make sure the tray app isn't running while files are removed
 Filename: "{sys}\taskkill.exe"; Parameters: "/f /im {#AppExe}"; Flags: runhidden; RunOnceId: "StopApp"
 
 [UninstallDelete]
 Type: files; Name: "{app}\{#AppExe}.old"
 Type: files; Name: "{app}\{#AppExe}.download"
+Type: files; Name: "{app}\{#AppExe}.*.old"
 Type: filesandordirs; Name: "{localappdata}\StopProcessing"

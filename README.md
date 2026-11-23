@@ -27,6 +27,7 @@ Running a newer installer over an existing install upgrades it in place.
 - **Windows system processes are never touched.** That covers `explorer`, `svchost`, `lsass`, Defender, drivers and anything in `C:\Windows`.
 - **No questions asked:** everything you started (browsers, editors, `node`, `bun`, terminals...) is stopped one by one in a single click. Windows processes and services are never touched.
 - Optional **"Shut down PC when finished"**: the PC powers off 15 seconds after the run, and you can cancel it in that time.
+- **Keep list:** apps you choose (Claude, Vibe Route and Stop Processing itself by default) are never stopped by Stop All. Right-click a process to add it, or manage the list in Settings.
 
 ### 2. Cleaner: delete temp files in one click
 | Location | Default |
@@ -69,6 +70,18 @@ Running a newer installer over an existing install upgrades it in place.
 | **Restart Explorer** | Fixes a frozen taskbar, Start menu or desktop |
 | **Disk Health** | Shows whether each HDD/SSD reports *Healthy*, and warns you to back up if it doesn't |
 | **Battery Report** | Opens Windows' detailed laptop battery report (capacity and wear) |
+| **Startup Manager** | Turns programs that start with Windows on or off (nothing is deleted) |
+| **Scheduled Shutdown** | Shuts the PC down after a delay or at a set time, optionally cleaning and stopping apps first |
+| **Big Files Finder** | Shows the largest files and folders on a drive; delete sends them to the Recycle Bin |
+| **Uninstall Leftovers** | Finds folders left behind by programs that are no longer installed |
+| **App Uninstaller** | Lists every installed program and removes it together with the files and settings it leaves behind |
+
+#### 🧹 App Uninstaller
+Pick any installed program and press **Uninstall**. Its own uninstaller runs first; when it is done, Vibe Stop Processing looks for what the program left behind (its install folder, its data in AppData and ProgramData, and its settings in the registry) and removes it in one click.
+- Items that clearly belong to the program are ticked for you; weaker matches are left for you to decide.
+- Folders go to the **Recycle Bin**, and every registry key is **backed up** to a `.reg` file before it is removed.
+- Folders used by another installed program are never touched.
+- **Remove leftovers only** cleans up a program whose uninstaller is already gone.
 
 **Delete Permanently (built-in unlocker):** erases a file or folder (e.g. `node_modules`) without the Recycle Bin, after a strong warning. It escalates step by step: normal delete with `\\?\` long-path support → take ownership + grant Administrators → find the programs locking the files (Restart Manager) and offer **Close & Delete** → **Delete on Restart** (`MoveFileEx`). Drives, Windows, Program Files and the main user folders are blocked.
 
@@ -88,6 +101,8 @@ The **This PC** panel shows the Windows version, CPU, RAM use, uptime, and free 
 - Release notes for each version are shown in the app.
 
 ---
+- **Clean temp files before shutting down** (off by default) runs the Cleaner before every Shut Down.
+- **Alerts:** a tray message when one app uses too much RAM (1, 2 or 4 GB) or more than 80% CPU for 30 seconds.
 
 ## How to use
 1. Download and run `VibeStopProcessing-Setup-x.y.z.exe` from the [Releases page](../../releases/latest).

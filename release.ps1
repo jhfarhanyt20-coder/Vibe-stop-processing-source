@@ -19,6 +19,19 @@ Set-Location $PSScriptRoot
 # Source code lives in the PRIVATE repo (git origin).
 # Users download from the PUBLIC repo, which only holds README, LICENSE and the releases.
 $PublicRepo = "jhfarhanyt20-coder/Vibe-stop-processing"
+$SourceRepo = "jhfarhanyt20-coder/Vibe-stop-processing-source"
+
+# Safety: this folder must be its OWN git repository whose origin is the private
+# source repo. If it sits inside another repository (for example a copy inside the
+# VibeCoder folder), "git add / push" would publish that other repository instead.
+$top = (git rev-parse --show-toplevel 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not $top -or ((Resolve-Path $top).Path.TrimEnd('\') -ne (Resolve-Path $PSScriptRoot).Path.TrimEnd('\'))) {
+    throw "This folder is not its own git repository. Clone $SourceRepo and run release.ps1 there."
+}
+$origin = (git remote get-url origin 2>$null)
+if ($origin -notmatch [regex]::Escape($SourceRepo) + '(\.git)?$') {
+    throw "git origin is '$origin', expected the private repo $SourceRepo. Nothing was changed."
+}
 
 # find the highest released version (public releases + local tags) and add 0.1
 git fetch --tags --quiet
@@ -44,7 +57,7 @@ $cs = $cs -replace 'AssemblyFileVersion\("[\d\.]+"\)', "AssemblyFileVersion(`"$V
 & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ `
     /out:StopProcessing.exe /win32manifest:app.manifest /win32icon:app.ico `
     /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll StopProcessing.cs
-if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+if ($LASTEXITCODE -ne 0) { git checkout -- StopProcessing.cs 2>$null; throw "Build failed" }
 
 # 3. build the installer
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
@@ -71,16 +84,32 @@ Write-Host "Built StopProcessing.exe, $setup and dist\latest.json" -ForegroundCo
 if ($BuildOnly) { return }
 
 # 5. commit + tag the source in the private repo
-git add -A
+#    git prints harmless warnings (line endings) on stderr; with 'Stop' PowerShell would treat
+#    them as errors, so from here every step is checked with $LASTEXITCODE instead
+$ErrorActionPreference = 'Continue'
+#    only the project's own files are added (never a stray log, key or download)
+git add StopProcessing.cs StopProcessing.exe installer.iss release.ps1 app.manifest app.ico README.md LICENSE public/README.md .gitignore
+if ($LASTEXITCODE -ne 0) { throw "git add failed" }
 git commit -m "Release v$Version"
+if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
 git tag "v$Version"
+if ($LASTEXITCODE -ne 0) { throw "git tag failed" }
 git push
+if ($LASTEXITCODE -ne 0) { throw "git push failed - nothing was published" }
 git push origin "v$Version"
+if ($LASTEXITCODE -ne 0) { throw "pushing the tag failed - nothing was published" }
 
 # 6. publish the release on the PUBLIC repo (no source code there)
 #    - VibeStopProcessing-Setup-x.y.z.exe : for new users
 #    - StopProcessing.exe + latest.json   : used by the in-app auto updater
 gh release create "v$Version" $setup StopProcessing.exe dist\latest.json --repo $PublicRepo --target main `
     --title "Vibe Stop Processing v$Version" --notes $Notes
+if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed. Check https://github.com/$PublicRepo/releases" }
+
+# 7. make sure every file the updater and new users need is really there
+$names = @(gh release view "v$Version" --repo $PublicRepo --json assets --jq ".assets[].name")
+foreach ($n in @("VibeStopProcessing-Setup-$Version.exe", "StopProcessing.exe", "latest.json")) {
+    if ($names -notcontains $n) { throw "The release is missing $n" }
+}
 
 Write-Host "Released v$Version" -ForegroundColor Green

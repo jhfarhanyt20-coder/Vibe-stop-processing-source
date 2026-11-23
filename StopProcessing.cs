@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Vibe")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.2.0")]
-[assembly: AssemblyFileVersion("2.5.2.0")]
+[assembly: AssemblyVersion("2.5.3.0")]
+[assembly: AssemblyFileVersion("2.5.3.0")]
 
 namespace StopProcessing
 {
@@ -51,6 +51,32 @@ namespace StopProcessing
             get { return "https://github.com/" + Owner + "/" + Repo; }
         }
 
+        /// True when the app runs from Program Files (where the installer puts it).
+        /// Only administrators can change files there, so the exe can't be swapped
+        /// by another program. "Start with Windows" (runs as admin at sign-in) and
+        /// self-update are allowed only then.
+        public static bool InSafeFolder
+        {
+            get
+            {
+                try
+                {
+                    string dir = Path.GetDirectoryName(Application.ExecutablePath);
+                    string real = PermanentDeleteForm.PlainPath(Native.FinalPath(dir)) ?? dir;
+                    foreach (var root in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) })
+                    {
+                        if (string.IsNullOrEmpty(root)) continue;
+                        string r = root.TrimEnd('\\') + "\\";
+                        if (real.StartsWith(r, StringComparison.OrdinalIgnoreCase) && dir.StartsWith(r, StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                }
+                catch { }
+                return false;
+            }
+        }
+
+        public const string NotInstalledText = "This copy is not installed. Run VibeStopProcessing-Setup to install it in Program Files; updates and Start with Windows work in the installed app.";
+
         public static string DataDir
         {
             get
@@ -69,6 +95,11 @@ namespace StopProcessing
         public bool CloseToTray = true;
         public bool TrayHintShown = false;
         public DateTime LastCheck = DateTime.MinValue;
+        public bool CleanOnShutdown = false;
+        public bool AlertRam = true;
+        public bool AlertCpu = true;
+        public int AlertRamGb = 2;
+        public string KeepApps = "claude;Vibe Route;StopProcessing";
 
         private static string FilePath { get { return Path.Combine(AppInfo.DataDir, "settings.ini"); } }
 
@@ -87,6 +118,15 @@ namespace StopProcessing
                     else if (k == "StartWithWindows") s.StartWithWindows = v != "0";
                     else if (k == "CloseToTray") s.CloseToTray = v != "0";
                     else if (k == "TrayHintShown") s.TrayHintShown = v != "0";
+                    else if (k == "CleanOnShutdown") s.CleanOnShutdown = v == "1";
+                    else if (k == "AlertRam") s.AlertRam = v != "0";
+                    else if (k == "AlertCpu") s.AlertCpu = v != "0";
+                    else if (k == "AlertRamGb")
+                    {
+                        int gb;
+                        if (int.TryParse(v, out gb) && (gb == 1 || gb == 2 || gb == 4)) s.AlertRamGb = gb;
+                    }
+                    else if (k == "KeepApps") s.KeepApps = v;
                     else if (k == "LastCheck")
                     {
                         long ticks;
@@ -108,6 +148,11 @@ namespace StopProcessing
                     "StartWithWindows=" + (StartWithWindows ? "1" : "0"),
                     "CloseToTray=" + (CloseToTray ? "1" : "0"),
                     "TrayHintShown=" + (TrayHintShown ? "1" : "0"),
+                    "CleanOnShutdown=" + (CleanOnShutdown ? "1" : "0"),
+                    "AlertRam=" + (AlertRam ? "1" : "0"),
+                    "AlertCpu=" + (AlertCpu ? "1" : "0"),
+                    "AlertRamGb=" + AlertRamGb,
+                    "KeepApps=" + (KeepApps ?? ""),
                     "LastCheck=" + LastCheck.Ticks
                 });
             }
@@ -243,11 +288,40 @@ namespace StopProcessing
         /// Downloads the new exe next to the current one and verifies it.
         public static string Download(UpdateInfo i, Action<int> percent)
         {
+            if (!AppInfo.InSafeFolder) throw new Exception(AppInfo.NotInstalledText);
+            if (string.IsNullOrEmpty(i.Sha256) || i.Sha256.Length != 64) throw new Exception("The update has no checksum \u2014 update rejected.");
+            string expected = "https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/download/";
+            if (string.IsNullOrEmpty(i.Url) || !i.Url.StartsWith(expected, StringComparison.OrdinalIgnoreCase))
+                throw new Exception("The update does not come from the official release page \u2014 update rejected.");
+
             string tmp = Exe + ".download";
             if (File.Exists(tmp)) File.Delete(tmp);
 
-            var req = Request(i.Url);
-            using (var resp = req.GetResponse())
+            // follow GitHub's download redirects by hand: https only
+            string url = i.Url;
+            HttpWebResponse first = null;
+            for (int hop = 0; hop < 6; hop++)
+            {
+                var r = Request(url);
+                r.AllowAutoRedirect = false;
+                var resp0 = (HttpWebResponse)r.GetResponse();
+                int sc = (int)resp0.StatusCode;
+                if (sc >= 300 && sc < 400)
+                {
+                    string next = resp0.Headers["Location"];
+                    resp0.Close();
+                    if (string.IsNullOrEmpty(next)) throw new Exception("Download failed (empty redirect).");
+                    var nu = new Uri(new Uri(url), next);
+                    if (nu.Scheme != Uri.UriSchemeHttps) throw new Exception("Download was redirected to an insecure address \u2014 update rejected.");
+                    url = nu.ToString();
+                    continue;
+                }
+                first = resp0;
+                break;
+            }
+            if (first == null) throw new Exception("Download failed (too many redirects).");
+
+            using (var resp = first)
             using (var src = resp.GetResponseStream())
             using (var dst = File.Create(tmp))
             {
@@ -275,7 +349,6 @@ namespace StopProcessing
                 if (fs.ReadByte() != 'M' || fs.ReadByte() != 'Z') { fs.Close(); File.Delete(tmp); throw new Exception("Downloaded file is not a valid program."); }
             }
 
-            if (!string.IsNullOrEmpty(i.Sha256))
             {
                 string hash;
                 using (var sha = SHA256.Create())
@@ -382,11 +455,32 @@ namespace StopProcessing
                 "  <Actions Context=\"Author\"><Exec><Command>" + Esc(exe) + "</Command><Arguments>--tray</Arguments></Exec></Actions>\r\n" +
                 "</Task>\r\n";
 
-            string file = Path.Combine(Path.GetTempPath(), "VibeStopProcessing_task.xml");
-            File.WriteAllText(file, xml, System.Text.Encoding.Unicode);
+            if (!AppInfo.InSafeFolder) return AppInfo.NotInstalledText;
+
+            // The task file is written into a new folder that only Administrators and
+            // SYSTEM can open (created with that permission in one step), so no other
+            // program can swap the file before schtasks reads it.
+            string dir = Path.Combine(Path.GetTempPath(), "VibeStopProcessing_" + Guid.NewGuid().ToString("N"));
+            var sec = new System.Security.AccessControl.DirectorySecurity();
+            sec.SetAccessRuleProtection(true, false);
+            foreach (var sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
+                sec.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(new SecurityIdentifier(sid, null),
+                    System.Security.AccessControl.FileSystemRights.FullControl,
+                    System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit,
+                    System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+            string file = Path.Combine(dir, "task.xml");
             int code;
-            string output = Native.Run("schtasks.exe", "/create /tn \"" + TaskName + "\" /xml \"" + file + "\" /f", out code);
-            try { File.Delete(file); } catch { }
+            string output;
+            try
+            {
+                Directory.CreateDirectory(dir, sec);
+                File.WriteAllText(file, xml, System.Text.Encoding.Unicode);
+                output = Native.Run("schtasks.exe", "/create /tn \"" + TaskName + "\" /xml \"" + file + "\" /f", out code);
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); } catch { }
+            }
             return code == 0 ? null : output.Trim();
         }
 
@@ -565,6 +659,78 @@ namespace StopProcessing
             public long i64NumItems;
         }
 
+        delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+        [DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder buf, int max);
+
+        /// True when the process shows a visible dialog box (class #32770), e.g. "Save changes?".
+        public static bool HasDialog(int pid)
+        {
+            bool found = false;
+            try
+            {
+                EnumWindows((hw, lp) =>
+                {
+                    uint wp;
+                    GetWindowThreadProcessId(hw, out wp);
+                    if (wp != (uint)pid || !IsWindowVisible(hw)) return true;
+                    var sb = new System.Text.StringBuilder(64);
+                    GetClassName(hw, sb, sb.Capacity);
+                    if (sb.ToString() == "#32770") { found = true; return false; }
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return found;
+        }
+
+        /// Starts Explorer (the taskbar and desktop) for this user WITHOUT admin
+        /// rights, even though this app runs as administrator.
+        public static void StartShellUnelevated()
+        {
+            string explorer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+            try
+            {
+                var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "runas.exe"), "/trustlevel:0x20000 \"" + explorer + "\"")
+                { UseShellExecute = false, CreateNoWindow = true };
+                using (var p = Process.Start(psi)) { p.WaitForExit(5000); }
+                for (int i = 0; i < 12; i++) { Thread.Sleep(250); if (ShellRunning()) return; }
+            }
+            catch { }
+            try { Process.Start(explorer); } catch { }
+        }
+
+        /// True when Explorer is running in THIS user's session.
+        public static bool ShellRunning()
+        {
+            int me = Process.GetCurrentProcess().SessionId;
+            foreach (var p in Process.GetProcessesByName("explorer"))
+            {
+                try { if (p.SessionId == me) return true; } catch { }
+                finally { p.Dispose(); }
+            }
+            return false;
+        }
+
+        [DllImport("user32.dll")]
+        static extern bool AllowSetForegroundWindow(int processId);
+
+        /// Lets a program this app starts bring its own window to the front.
+        public static void AllowAnyForeground()
+        {
+            try { AllowSetForegroundWindow(-1); } catch { } // -1 = ASFW_ANY
+        }
+
         public static void DarkScroll(Control c)
         {
             try { SetWindowTheme(c.Handle, "DarkMode_Explorer", null); } catch { }
@@ -576,7 +742,11 @@ namespace StopProcessing
             SendMessage(f.Handle, 0xA1, (IntPtr)2, IntPtr.Zero);
         }
 
-        public static string Run(string file, string args, out int exitCode)
+        /// Runs a tool and returns stdout + stderr. Both streams are read at the
+        /// same time (a child that fills stderr can't deadlock it), and the tool
+        /// is stopped after timeoutMs (-1 = wait as long as it takes, for
+        /// sfc/dism and big folder trees).
+        public static string Run(string file, string args, out int exitCode, int timeoutMs = 120000)
         {
             exitCode = -1;
             try
@@ -590,16 +760,112 @@ namespace StopProcessing
                 };
                 using (var p = Process.Start(psi))
                 {
-                    string o = p.StandardOutput.ReadToEnd();
-                    string e = p.StandardError.ReadToEnd();
-                    p.WaitForExit(15000);
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    bool done = timeoutMs < 0 ? p.WaitForExit(int.MaxValue) : p.WaitForExit(timeoutMs);
+                    if (!done)
+                    {
+                        try { p.Kill(); } catch { }
+                        try { p.WaitForExit(3000); } catch { }
+                        return "Timed out: " + Path.GetFileName(file) + " did not finish in " + (timeoutMs / 1000) + " s.";
+                    }
+                    p.WaitForExit(); // flush the async readers
                     exitCode = p.ExitCode;
+                    string o = "", e = "";
+                    try { if (outTask.Wait(5000)) o = outTask.Result; } catch { }
+                    try { if (errTask.Wait(5000)) e = errTask.Result; } catch { }
                     return o + e;
                 }
             }
             catch (Exception ex)
             {
                 return ex.Message;
+            }
+        }
+
+        // ---- safe delete: never leave the folder being cleaned ----
+        // The cleaner runs as administrator inside folders that other programs
+        // can write to (%TEMP%, C:\Windows\Temp). A folder there could be swapped
+        // for a junction between listing and deleting, pointing anywhere on the
+        // disk. So every file is opened first (without following links), the
+        // real path of that open file is checked to still be inside the folder
+        // being cleaned, and only then is that exact file deleted through the
+        // same handle.
+        const uint DELETE = 0x00010000, FILE_READ_ATTRIBUTES = 0x0080, FILE_WRITE_ATTRIBUTES = 0x0100;
+        const uint FILE_SHARE_ALL = 0x7, OPEN_EXISTING = 3;
+        const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000, FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, System.Text.StringBuilder buf, uint size, uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle h, int infoClass, out FILE_BASIC_INFO info, uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle h, int infoClass, ref FILE_BASIC_INFO info, uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle h, int infoClass, ref byte deleteFile, uint size);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct FILE_BASIC_INFO { public long CreationTime, LastAccessTime, LastWriteTime, ChangeTime; public uint FileAttributes; public uint Pad; }
+
+        /// The real, link-free path of a file or folder ("\\?\C:\..."), or null.
+        public static string FinalPath(string path)
+        {
+            using (var h = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
+            {
+                if (h.IsInvalid) return null;
+                return FinalPathOf(h);
+            }
+        }
+
+        static string FinalPathOf(Microsoft.Win32.SafeHandles.SafeFileHandle h)
+        {
+            var sb = new System.Text.StringBuilder(1024);
+            uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+            if (n == 0) return null;
+            if (n >= sb.Capacity) { sb = new System.Text.StringBuilder((int)n + 1); if (GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0) == 0) return null; }
+            return sb.ToString();
+        }
+
+        /// Deletes one file only if it really is inside rootFinal (a FinalPath
+        /// result). Links are deleted as links, never followed. Throws
+        /// IOException when the file is in use or protected (the cleaner counts
+        /// it as skipped), returns false when it is outside the folder.
+        public static bool SafeDeleteUnder(string rootFinal, string path, out long length)
+        {
+            length = 0;
+            using (var h = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING,
+                                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
+            {
+                if (h.IsInvalid) throw new IOException("cannot open " + path, Marshal.GetHRForLastWin32Error());
+                string real = FinalPathOf(h);
+                if (real == null || rootFinal == null) return false;
+                string root = rootFinal.TrimEnd('\\') + "\\";
+                if (!real.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return false;
+
+                FILE_BASIC_INFO bi;
+                if (GetFileInformationByHandleEx(h, 0 /* FileBasicInfo */, out bi, (uint)Marshal.SizeOf(typeof(FILE_BASIC_INFO))))
+                {
+                    if ((bi.FileAttributes & 0x10) != 0) return false; // a folder: the cleaner only deletes files here
+                    if ((bi.FileAttributes & 0x1) != 0) // read-only: clear it on this same file
+                    {
+                        var clear = bi;
+                        clear.CreationTime = clear.LastAccessTime = clear.LastWriteTime = clear.ChangeTime = 0; // 0 = keep
+                        clear.FileAttributes = (bi.FileAttributes & ~0x1u);
+                        if (clear.FileAttributes == 0) clear.FileAttributes = 0x80; // NORMAL
+                        SetFileInformationByHandle(h, 0, ref clear, (uint)Marshal.SizeOf(typeof(FILE_BASIC_INFO)));
+                    }
+                }
+                try { length = new FileInfo(path).Length; } catch { }
+                byte del = 1;
+                if (!SetFileInformationByHandle(h, 4 /* FileDispositionInfo */, ref del, 1))
+                    throw new IOException("cannot delete " + path, Marshal.GetHRForLastWin32Error());
+                return true;
             }
         }
     }
@@ -1425,6 +1691,7 @@ namespace StopProcessing
 
             BuildTray();
             StartTimer();
+            StartAlerts();
 
             // background start-up work runs from here (OnShown does not fire while hidden in the tray)
             var t = new System.Windows.Forms.Timer { Interval = 4000 };
@@ -1466,6 +1733,10 @@ namespace StopProcessing
             item("Tools", (s, e) => ShowFromTray(3));
             item("Settings", (s, e) => ShowFromTray(SettingsPage));
             menu.Items.Add(new ToolStripSeparator());
+            trayUpdateItem = item("Check for Updates", (s, e) => TrayUpdateClicked());
+            menu.Items.Add(new ToolStripSeparator());
+            traySchedCancel = item("Cancel scheduled shutdown", (s, e) => CancelScheduledShutdown(true));
+            traySchedCancel.Visible = false;
             var shut = item("Shut Down PC", (s, e) => { ShowFromTray(-1); FullShutdown(); });
             shut.ForeColor = Theme.Red;
             menu.Items.Add(new ToolStripSeparator());
@@ -1479,6 +1750,11 @@ namespace StopProcessing
                 Visible = true
             };
             tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) ShowFromTray(-1); };
+            tray.BalloonTipClicked += (s, e) =>
+            {
+                var a = balloonAction;
+                if (a != null && tray.BalloonTipTitle == balloonTitle) { balloonAction = null; a(); }
+            };
         }
 
         protected override void SetVisibleCore(bool value)
@@ -1524,15 +1800,62 @@ namespace StopProcessing
             reallyExit = false; // only reached if closing was cancelled
         }
 
-        private void SyncStartupTask()
+        private ToolStripMenuItem trayUpdateItem;
+
+        /// Tray "Check for Updates" -> "Update Now (x.y.z)" -> "Restart to Update".
+        private void RefreshTrayUpdateItem()
+        {
+            if (trayUpdateItem == null) return;
+            if (updateInstalled) { trayUpdateItem.Text = "Restart to Update"; trayUpdateItem.Enabled = true; }
+            else if (isUpdating) { trayUpdateItem.Text = "Updating\u2026"; trayUpdateItem.Enabled = false; }
+            else if (pendingUpdate != null) { trayUpdateItem.Text = "Update Now (" + pendingUpdate.Tag.TrimStart('v', 'V') + ")"; trayUpdateItem.Enabled = true; }
+            else { trayUpdateItem.Text = "Check for Updates"; trayUpdateItem.Enabled = true; }
+        }
+
+        private void TrayUpdateClicked()
+        {
+            if (updateInstalled) { RestartIntoUpdate(); return; }
+            ShowFromTray(SettingsPage);
+            if (pendingUpdate != null) InstallUpdate(false);
+            else CheckForUpdates(true);
+        }
+
+        private void RestartIntoUpdate()
+        {
+            if (isStopping || isCleaning)
+            {
+                ShowFromTray(-1);
+                ThemedDialog.Show(this, "Restart to update", "Wait until the current job finishes, then restart to update.", new[] { "OK" }, 0, Theme.Blue);
+                return;
+            }
+            try { Updater.Restart(!Visible); reallyExit = true; Close(); } catch { reallyExit = false; }
+        }
+
+        private void SyncStartupTask(bool userAsked = false)
         {
             if (!isAdmin) return;
             bool want = settings.StartWithWindows;
+            bool safe = AppInfo.InSafeFolder;
             var th = new Thread(() =>
             {
-                // re-registering on every start keeps the task pointing at the current exe location
-                if (want) StartupTask.Enable();
-                else if (StartupTask.Exists()) StartupTask.Disable();
+                string error = null;
+                try
+                {
+                    // re-registering on every start keeps the task pointing at the current exe location
+                    if (want && safe) error = StartupTask.Enable();
+                    else
+                    {
+                        // a copy outside Program Files never starts as admin at sign-in
+                        if (StartupTask.Exists()) StartupTask.Disable();
+                        if (want) error = AppInfo.NotInstalledText;
+                    }
+                }
+                catch (Exception ex) { error = ex.Message; }
+                if (error != null && userAsked)
+                {
+                    string msg = error;
+                    Ui(() => ThemedDialog.Show(this, "Start with Windows", msg, new[] { "OK" }, 0, Theme.Amber));
+                }
             });
             th.IsBackground = true;
             th.Start();
@@ -1747,10 +2070,10 @@ namespace StopProcessing
             while (box.Items.Count > 500) box.Items.RemoveAt(box.Items.Count - 1);
         }
 
-        private void Ui(Action a)
+        private bool Ui(Action a)
         {
-            if (IsDisposed) return;
-            try { BeginInvoke(a); } catch { }
+            if (IsDisposed) return false;
+            try { BeginInvoke(a); return true; } catch { return false; }
         }
 
         private int AskOnUi(string title, string message, string[] buttons, int primary, Color accent)
@@ -1903,6 +2226,7 @@ namespace StopProcessing
             Color c;
             if (role == "SYSTEM PROTECTED") { text = "Protected"; c = Theme.Green; }
             else if (role == "CONFIRM") { text = "Ask first"; c = Theme.Amber; }
+            else if (role == "KEPT") { text = "Kept"; c = Theme.Blue; }
             else { text = "Stoppable"; c = Theme.Muted; }
 
             var g = e.Graphics;
@@ -1930,7 +2254,7 @@ namespace StopProcessing
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
             t.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            var desc = MakeLabel("One click stops every app you started (browsers, node, bun, terminals...) one by one, without asking. Windows processes are never touched. Right-click a process to stop just that one.",
+            var desc = MakeLabel("One click stops every app you started (browsers, node, bun, terminals...) one by one, without asking. An app that asks to save your work is left open. Windows processes are never touched. Right-click a process to stop just that one.",
                 Theme.F(9f), Theme.Muted, ContentAlignment.TopLeft);
             desc.AutoEllipsis = false;
 
@@ -1967,7 +2291,7 @@ namespace StopProcessing
         private static extern bool QueryFullProcessImageName(IntPtr h, int flags, System.Text.StringBuilder name, ref int size);
 
         private readonly object snapshotLock = new object();
-        private readonly Dictionary<int, string> pathCache = new Dictionary<int, string>();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> pathCache = new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
         private static readonly int mySession = Process.GetCurrentProcess().SessionId;
         private static readonly int myPid = Process.GetCurrentProcess().Id;
         private volatile bool refreshing;
@@ -1982,7 +2306,7 @@ namespace StopProcessing
         }
 
         /// Fast, exception-free way to get a process's exe path (works for most elevated processes too).
-        private static string ExePath(int pid)
+        internal static string ExePath(int pid)
         {
             IntPtr h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
             if (h == IntPtr.Zero) return "";
@@ -2016,12 +2340,12 @@ namespace StopProcessing
                 Snapshot snap = null;
                 try { snap = TakeSnapshot(); }
                 catch { }
-                Ui(() =>
+                bool queued = Ui(() =>
                 {
                     try { if (snap != null) ApplySnapshot(snap); }
                     finally { refreshing = false; }
                 });
-                if (IsDisposed) refreshing = false;
+                if (!queued || IsDisposed) refreshing = false;
             });
         }
 
@@ -2048,15 +2372,15 @@ namespace StopProcessing
                         snap.Memory += mem;
                         snap.Cpu += cpu;
                         var row = new ProcRow { Pid = pid, Name = p.ProcessName, Memory = mem, Cpu = cpu, Path = path, Session = session };
-                        row.Role = IsProtected(row) ? "SYSTEM PROTECTED" : "normal";
-                        if (row.Role != "SYSTEM PROTECTED") snap.Stoppable++;
+                        row.Role = IsProtected(row) ? "SYSTEM PROTECTED" : IsKept(row.Name) ? "KEPT" : "normal";
+                        if (row.Role == "normal") snap.Stoppable++;
                         snap.Rows.Add(row);
                     }
                     catch { }
                     finally { p.Dispose(); }
                 }
                 foreach (var dead in lastSample.Keys.Where(k => !alive.Contains(k)).ToList()) lastSample.Remove(dead);
-                foreach (var dead in pathCache.Keys.Where(k => !alive.Contains(k)).ToList()) pathCache.Remove(dead);
+                foreach (var dead in pathCache.Keys.Where(k => !alive.Contains(k)).ToList()) { string gone; pathCache.TryRemove(dead, out gone); }
                 snap.Rows = snap.Rows.OrderByDescending(r => r.Memory).ToList();
                 return snap;
             }
@@ -2210,6 +2534,13 @@ namespace StopProcessing
                         StopPids(pids, name);
                     }) { Padding = new Padding(8, 5, 8, 5), ForeColor = Theme.Red });
                 }
+                procMenu.Items.Add(new ToolStripSeparator());
+                bool inKeep = InKeepList(name);
+                procMenu.Items.Add(new ToolStripMenuItem(inKeep ? "Remove from keep list" : "Always keep this app", null, (s, e) =>
+                {
+                    if (inKeep) RemoveKeep(name); else AddKeep(name);
+                    AddLog(stopLog, name + (inKeep ? " removed from the keep list." : " added to the keep list. Stop All will leave it running."));
+                }) { Padding = new Padding(8, 5, 8, 5) });
             }
             if (!string.IsNullOrEmpty(path))
             {
@@ -2242,6 +2573,13 @@ namespace StopProcessing
 
         private void StopButton_Click(object sender, EventArgs e)
         {
+            StartStopAll(null);
+        }
+
+        /// Stop All. onFinished (if given) runs on the UI thread when it is done,
+        /// instead of the "Shut down PC when finished" countdown.
+        private void StartStopAll(Action onFinished)
+        {
             if (isStopping) return;
             isStopping = true;
             stopButton.Enabled = false;
@@ -2256,12 +2594,22 @@ namespace StopProcessing
 
             var worker = new Thread(() =>
             {
-                var targets = TakeSnapshot().Rows.Where(r => r.Role != "SYSTEM PROTECTED").ToList();
+                List<ProcRow> targets;
+                try { targets = TakeSnapshot().Rows.Where(r => r.Role != "SYSTEM PROTECTED").ToList(); }
+                catch { targets = new List<ProcRow>(); }
+                var kept = targets.Where(r => r.Role == "KEPT" || IsKept(r.Name)).ToList();
+                targets = targets.Except(kept).ToList();
+                int keptCount = kept.Count;
+                foreach (var kp in kept)
+                {
+                    string kn = kp.Name;
+                    Ui(() => AddLog(stopLog, kn + " \u2192 Kept (keep list)"));
+                }
                 int total = targets.Count;
                 Ui(() =>
                 {
                     stopProgress.Maximum = Math.Max(1, total);
-                    AddLog(stopLog, "Stopping " + total + " processes.");
+                    AddLog(stopLog, "Stopping " + total + " processes." + (keptCount > 0 ? " Keeping " + keptCount + " (keep list)." : ""));
                 });
 
                 int done = 0, ok = 0;
@@ -2288,10 +2636,12 @@ namespace StopProcessing
                     isStopping = false;
                     stopButton.Enabled = true;
                     stopButton.Text = "Stop All Processes";
-                    procHeader.Subtitle = "Finished. Stopped " + stopped + " of " + total + " processes.";
-                    AddLog(stopLog, "Finished. " + stopped + "/" + total + " stopped.");
+                    string keptText = keptCount > 0 ? " Kept " + keptCount + " (keep list)." : "";
+                    procHeader.Subtitle = "Finished. Stopped " + stopped + " of " + total + " processes." + keptText;
+                    AddLog(stopLog, "Finished. " + stopped + "/" + total + " stopped." + keptText);
                     RefreshGrid();
-                    if (shutdownWhenDone && !token.IsCancellationRequested) ShutdownCountdown();
+                    if (onFinished != null) { if (!token.IsCancellationRequested) onFinished(); }
+                    else if (shutdownWhenDone && !token.IsCancellationRequested) ShutdownCountdown();
                 });
             });
             worker.IsBackground = true;
@@ -2316,7 +2666,10 @@ namespace StopProcessing
                 if (win != IntPtr.Zero)
                 {
                     try { p.CloseMainWindow(); } catch { }
-                    if (p.WaitForExit(1200)) return "Closed";
+                    if (p.WaitForExit(2500)) return "Closed";
+                    // it answered the close with a dialog (usually "Save changes?"): killing it now
+                    // would lose that work, so it is left open for the user
+                    if (Native.HasDialog(pid)) return "Left open (unsaved work)";
                 }
                 p.Kill();
                 p.WaitForExit(2000);
@@ -2690,17 +3043,33 @@ namespace StopProcessing
                     }
                     else
                     {
+                        // the real (link-free) path of every folder being cleaned: a file is
+                        // deleted only while it is really inside one of them (see SafeDeleteUnder)
+                        var roots = new List<KeyValuePair<string, string>>();
+                        foreach (var d in t.Dirs)
+                        {
+                            string fp = null;
+                            try { if (Directory.Exists(d)) fp = Native.FinalPath(d); } catch { }
+                            if (fp != null) roots.Add(new KeyValuePair<string, string>(Path.GetFullPath(d).TrimEnd('\\') + "\\", fp));
+                        }
                         foreach (var f in kv.Value)
                         {
                             if (stop) break;
                             processed++;
                             try
                             {
-                                var fi = new FileInfo(f);
-                                if (!fi.Exists) continue;
-                                long len = fi.Length;
-                                if ((fi.Attributes & FileAttributes.ReadOnly) != 0) fi.Attributes = FileAttributes.Normal;
-                                fi.Delete();
+                                if (!File.Exists(f)) continue;
+                                string rootFinal = null;
+                                foreach (var r in roots)
+                                    if (f.StartsWith(r.Key, StringComparison.OrdinalIgnoreCase)) { rootFinal = r.Value; break; }
+                                long len;
+                                if (rootFinal == null || !Native.SafeDeleteUnder(rootFinal, f, out len))
+                                {
+                                    skipped++;
+                                    string outside = Path.GetFileName(f);
+                                    Ui(() => AddLog(cleanLog, "Skipped (not inside the folder any more): " + outside));
+                                    continue;
+                                }
                                 freed += len;
                                 deleted++;
                             }
@@ -2792,6 +3161,107 @@ namespace StopProcessing
         private const string KeyMaint = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance";
         private const string KeyCrash = @"SYSTEM\CurrentControlSet\Control\CrashControl";
         private const string KeyArso = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+
+        /// What the PC had before the first Fix (registry values, wake timers,
+        /// network card wake settings), so Restore puts back exactly that.
+        private static string PowerBackupFile
+        {
+            get
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StopProcessing");
+                Directory.CreateDirectory(dir);
+                return Path.Combine(dir, "power_backup.txt");
+            }
+        }
+
+        private static readonly Regex SafeAdapterName = new Regex(@"^[\w \-\(\)#\.,]+$");
+        private static readonly Regex SafeKeyword = new Regex(@"^\*?[A-Za-z0-9]+$");
+
+        private static void SavePowerBackup()
+        {
+            if (File.Exists(PowerBackupFile)) return; // keep the state from before the FIRST fix
+            var lines = new List<string>();
+            Action<string, string, string> reg = (tag, key, name) =>
+            {
+                int? v = ReadDword(key, name);
+                lines.Add(tag + "=" + (v.HasValue ? v.Value.ToString() : "none"));
+            };
+            reg("HiberbootEnabled", KeyPower, "HiberbootEnabled");
+            reg("WakeUp", KeyMaint, "WakeUp");
+            reg("AutoReboot", KeyCrash, "AutoReboot");
+            reg("DisableAutomaticRestartSignOn", KeyArso, "DisableAutomaticRestartSignOn");
+            int ac, dc;
+            if (ReadRtcWake(out ac, out dc)) { lines.Add("RtcWakeAc=" + ac); lines.Add("RtcWakeDc=" + dc); }
+            foreach (var kv in NicWakeSettings()) lines.Add("nic=" + kv.Key + "|" + kv.Value);
+            File.WriteAllLines(PowerBackupFile, lines.ToArray());
+        }
+
+        private static bool ReadRtcWake(out int ac, out int dc)
+        {
+            ac = dc = 0;
+            int code;
+            string o = Native.Run("powercfg.exe", "/q SCHEME_CURRENT SUB_SLEEP RTCWAKE", out code);
+            var m = Regex.Matches(o, @"0x([0-9a-fA-F]{8})");
+            if (code != 0 || m.Count < 2) return false;
+            ac = Convert.ToInt32(m[m.Count - 2].Groups[1].Value, 16);
+            dc = Convert.ToInt32(m[m.Count - 1].Groups[1].Value, 16);
+            return true;
+        }
+
+        /// Restores the saved state. Returns false when there is no backup (then the old defaults are used).
+        private static bool RestorePowerBackup(Action<string> log)
+        {
+            if (!File.Exists(PowerBackupFile)) return false;
+            var d = new Dictionary<string, string>();
+            var nic = new List<string[]>();
+            foreach (var line in File.ReadAllLines(PowerBackupFile))
+            {
+                int i = line.IndexOf('=');
+                if (i <= 0) continue;
+                string k = line.Substring(0, i), v = line.Substring(i + 1).Trim();
+                if (k == "nic") { var p = v.Split('|'); if (p.Length == 3) nic.Add(p); }
+                else d[k] = v;
+            }
+            Action<string, string, string, string> put = (tag, key, name, label) =>
+            {
+                string v;
+                if (!d.TryGetValue(tag, out v)) return;
+                int n;
+                if (v == "none") Step(log, label + " \u2192 as before", () => DeleteValue(key, name));
+                else if (int.TryParse(v, out n)) Step(log, label + " \u2192 as before", () => WriteDword(key, name, n));
+            };
+            put("HiberbootEnabled", KeyPower, "HiberbootEnabled", "Fast Startup");
+            put("WakeUp", KeyMaint, "WakeUp", "Maintenance wake-up");
+            put("AutoReboot", KeyCrash, "AutoReboot", "Restart on system failure");
+            put("DisableAutomaticRestartSignOn", KeyArso, "DisableAutomaticRestartSignOn", "Auto sign-in after updates");
+            string sac, sdc;
+            int iac, idc, code;
+            if (d.TryGetValue("RtcWakeAc", out sac) && d.TryGetValue("RtcWakeDc", out sdc) && int.TryParse(sac, out iac) && int.TryParse(sdc, out idc))
+                Step(log, "Wake timers \u2192 as before", () =>
+                {
+                    Native.Run("powercfg.exe", "/setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE " + iac, out code);
+                    Native.Run("powercfg.exe", "/setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE " + idc, out code);
+                    Native.Run("powercfg.exe", "/setactive SCHEME_CURRENT", out code);
+                });
+            // network cards: only names and values that look like real ones (the file is in a user folder)
+            var parts = new List<string>();
+            var touched = new HashSet<string>();
+            foreach (var p in nic)
+            {
+                if (!SafeAdapterName.IsMatch(p[0]) || !SafeKeyword.IsMatch(p[1]) || !Regex.IsMatch(p[2], @"^\d+$")) continue;
+                string n = p[0].Replace("'", "''");
+                parts.Add("Set-NetAdapterAdvancedProperty -Name '" + n + "' -RegistryKeyword '" + p[1] + "' -RegistryValue " + p[2] + " -NoRestart -ErrorAction SilentlyContinue");
+                touched.Add(n);
+            }
+            if (parts.Count > 0)
+            {
+                foreach (var n in touched) parts.Add("Restart-NetAdapter -Name '" + n + "' -ErrorAction SilentlyContinue");
+                RunPs(string.Join("; ", parts.ToArray()));
+                log("\u2713 Network card wake settings \u2192 as before");
+            }
+            try { File.Delete(PowerBackupFile); } catch { }
+            return true;
+        }
 
         private static string WakeListFile
         {
@@ -2949,13 +3419,22 @@ namespace StopProcessing
 
         private static List<string> WakeArmedDevices()
         {
-            int code;
-            string o = Native.Run("powercfg.exe", "/devicequery wake_armed", out code);
+            // "powercfg /devicequery wake_armed" prints a translated word ("NONE", "KEINE", ...)
+            // when nothing can wake the PC, so only names that are real wake-capable devices count
+            int code, code2;
+            string armed = Native.Run("powercfg.exe", "/devicequery wake_armed", out code);
+            string capable = Native.Run("powercfg.exe", "/devicequery wake_programmable", out code2);
             var list = new List<string>();
-            foreach (var raw in o.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            if (code != 0) return list;
+            var real = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (code2 == 0)
+                foreach (var raw in capable.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    if (raw.Trim().Length > 0) real.Add(raw.Trim());
+            foreach (var raw in armed.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
                 string l = raw.Trim();
-                if (l.Length == 0 || l.Equals("NONE", StringComparison.OrdinalIgnoreCase)) continue;
+                if (l.Length == 0) continue;
+                if (real.Count > 0 ? !real.Contains(l) : l.Equals("NONE", StringComparison.OrdinalIgnoreCase)) continue;
                 list.Add(l);
             }
             return list;
@@ -3118,6 +3597,7 @@ namespace StopProcessing
                 {
                     if (fix)
                     {
+                        try { SavePowerBackup(); } catch (Exception ex) { log("Could not save the current settings: " + ex.Message); }
                         Step(log, "Fast Startup \u2192 off", () => WriteDword(KeyPower, "HiberbootEnabled", 0));
 
                         Step(log, "Wake timers \u2192 disabled", () =>
@@ -3151,6 +3631,21 @@ namespace StopProcessing
                         Step(log, "Restart on system failure \u2192 off", () => WriteDword(KeyCrash, "AutoReboot", 0));
                         foreach (var line in SetNicWake(false)) log(line);
                         log("Done. Use \"Full Shut Down\" for a clean power-off.");
+                    }
+                    else if (RestorePowerBackup(log))
+                    {
+                        // wake-armed devices are re-enabled from their own list
+                        if (File.Exists(WakeListFile))
+                        {
+                            foreach (var d in File.ReadAllLines(WakeListFile))
+                            {
+                                if (d.Trim().Length == 0) continue;
+                                Native.Run("powercfg.exe", "/deviceenablewake \"" + d.Replace("\"", "") + "\"", out code);
+                                log((code == 0 ? "Wake enabled: " : "Could not change: ") + d);
+                            }
+                            try { File.Delete(WakeListFile); } catch { }
+                        }
+                        log("Restored the settings this PC had before the fix.");
                     }
                     else
                     {
@@ -3204,8 +3699,7 @@ namespace StopProcessing
                 "Windows will do a full shutdown now (not the hybrid Fast Startup one). Save your work first.",
                 new[] { "Shut Down", "Cancel" }, 0, Theme.Red);
             if (a != 0) return;
-            int code;
-            Native.Run("shutdown.exe", "/s /f /t 0", out code);
+            DoFullShutdown(settings.CleanOnShutdown);
         }
 
         // =================================================================
@@ -3269,11 +3763,10 @@ namespace StopProcessing
             body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330F));
 
             // ---- tool tiles (2 x 3) + a full-width "Delete Permanently" row
-            var grid2 = Table(2, 4, Theme.Bg);
-            grid2.Margin = new Padding(0, 0, 14, 0);
+            var grid2 = Table(2, 7, Theme.Bg);
             grid2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
             grid2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
-            for (int i = 0; i < 4; i++) grid2.RowStyles.Add(new RowStyle(SizeType.Percent, 25F));
+            for (int i = 0; i < 7; i++) grid2.RowStyles.Add(new RowStyle(SizeType.Percent, 100F / 7));
 
             var tiles = new[]
             {
@@ -3282,7 +3775,12 @@ namespace StopProcessing
                 new ToolTile("\uE774", "Fix Internet", "Reset DNS, Winsock and IP when the internet stops working.", FixInternet),
                 new ToolTile("\uE72C", "Restart Explorer", "Fixes a frozen taskbar, Start menu or desktop.", () => RunTool("Restart Explorer", RestartExplorer)),
                 new ToolTile("\uEDA2", "Disk Health", "Check whether your hard drive or SSD is healthy.", DiskHealth),
-                new ToolTile("\uE83F", "Battery Report", "See your laptop battery's real capacity and wear.", BatteryReport)
+                new ToolTile("\uE83F", "Battery Report", "See your laptop battery's real capacity and wear.", BatteryReport),
+                new ToolTile("\uE768", "Startup Manager", "Choose which programs start with Windows.", ShowStartupManager),
+                new ToolTile("\uE823", "Scheduled Shutdown", "Shut down the PC after a delay or at a set time.", ShowScheduledShutdown),
+                new ToolTile("\uE721", "Big Files Finder", "Find the largest files and folders on a drive.", ShowBigFiles),
+                new ToolTile("\uE8B7", "Uninstall Leftovers", "Find folders left behind by removed programs.", ShowLeftovers),
+                new ToolTile("\uE71D", "App Uninstaller", "Remove programs together with the files they leave behind.", ShowAppUninstaller)
             };
             for (int i = 0; i < tiles.Length; i++)
             {
@@ -3293,7 +3791,7 @@ namespace StopProcessing
             var wipe = new ToolTile("\uE74D", "Delete Permanently",
                 "Erase any file or folder, even locked ones that won't delete normally (like a huge node_modules). Skips the Recycle Bin \u2014 can't be undone.",
                 ShowPermanentDelete) { Dock = DockStyle.Fill, Margin = new Padding(0, 7, 0, 0), Danger = true };
-            grid2.Controls.Add(wipe, 0, 3);
+            grid2.Controls.Add(wipe, 0, 6);
             grid2.SetColumnSpan(wipe, 2);
 
             // ---- this PC + activity
@@ -3318,7 +3816,9 @@ namespace StopProcessing
             t.Controls.Add(toolsLog, 0, 5);
             card.Controls.Add(t);
 
-            body.Controls.Add(grid2, 0, 0);
+            var tilesHost = ScrollHost(grid2, 7 * 112);
+            tilesHost.Margin = new Padding(0, 0, 14, 0);
+            body.Controls.Add(tilesHost, 0, 0);
             body.Controls.Add(card, 1, 0);
             layout.Controls.Add(toolsHeader, 0, 0);
             layout.Controls.Add(body, 0, 1);
@@ -3480,18 +3980,20 @@ namespace StopProcessing
 
         private static bool RestartExplorer()
         {
+            // only this user's Explorer: other people signed in to this PC keep theirs
+            int me = Process.GetCurrentProcess().SessionId;
             foreach (var p in Process.GetProcessesByName("explorer"))
             {
-                try { p.Kill(); p.WaitForExit(3000); } catch { }
+                try { if (p.SessionId == me) { p.Kill(); p.WaitForExit(3000); } } catch { }
                 finally { p.Dispose(); }
             }
-            // Windows normally restarts the shell by itself; start it if it didn't
+            // Windows normally restarts the shell by itself; start it (without admin rights) if it didn't
             for (int i = 0; i < 20; i++)
             {
                 Thread.Sleep(250);
-                if (Process.GetProcessesByName("explorer").Length > 0) return true;
+                if (Native.ShellRunning()) return true;
             }
-            Process.Start(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"));
+            Native.StartShellUnelevated();
             return true;
         }
 
@@ -3571,7 +4073,7 @@ namespace StopProcessing
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72F));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            var header = new PageHeader("Settings", "Updates and information about this app.") { Dock = DockStyle.Fill };
+            var header = new PageHeader("Settings", "Updates, start-up, alerts, the Stop All keep list and information about this app.") { Dock = DockStyle.Fill };
 
             var body = Table(2, 1, Theme.Bg);
             body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
@@ -3608,7 +4110,7 @@ namespace StopProcessing
             checkUpdateButton.Click += (s, e) => CheckForUpdates(true);
             installUpdateButton = new FlatButton { Text = "Install Update", Glyph = "\uE896", Dock = DockStyle.Fill, Margin = new Padding(6, 8, 0, 8), Font = Theme.Semi(9.5f), Enabled = false };
             installUpdateButton.SetColor(Theme.Blue);
-            installUpdateButton.Click += (s, e) => InstallUpdate(false);
+            installUpdateButton.Click += (s, e) => { if (updateInstalled) RestartIntoUpdate(); else InstallUpdate(false); };
             btnRow.Controls.Add(checkUpdateButton, 0, 0);
             btnRow.Controls.Add(installUpdateButton, 1, 0);
 
@@ -3672,35 +4174,42 @@ namespace StopProcessing
 
             // ---- general card (start-up + tray)
             var general = new Card { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 12), Margin = new Padding(0, 0, 0, 14) };
-            var gt = Table(1, 4, Theme.Card);
+            var gt = Table(1, 8, Theme.Card);
             gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
-            gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
-            gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
+            for (int i = 0; i < 6; i++) gt.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
             gt.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             var startToggle = new CheckToggle { Text = "Start with Windows (in the tray)", Dock = DockStyle.Fill, Checked = settings.StartWithWindows };
             startToggle.CheckedChanged += (s, e) =>
             {
                 settings.StartWithWindows = startToggle.Checked;
                 settings.Save();
-                SyncStartupTask();
+                SyncStartupTask(true);
             };
             var trayToggle = new CheckToggle { Text = "Close button keeps it in the tray", Dock = DockStyle.Fill, Checked = settings.CloseToTray };
             trayToggle.CheckedChanged += (s, e) => { settings.CloseToTray = trayToggle.Checked; settings.Save(); };
             gt.Controls.Add(MakeLabel("General", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
             gt.Controls.Add(startToggle, 0, 1);
             gt.Controls.Add(trayToggle, 0, 2);
+            AddGeneralExtras(gt);
             general.Controls.Add(gt);
 
             var right = Table(1, 2, Theme.Bg);
-            right.RowStyles.Add(new RowStyle(SizeType.Absolute, 136F));
+            right.RowStyles.Add(new RowStyle(SizeType.Absolute, 300F));
             right.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             right.Controls.Add(general, 0, 0);
             right.Controls.Add(about, 0, 1);
 
-            body.Controls.Add(card, 0, 0);
+            card.Margin = new Padding(0, 0, 0, 14);
+            var left = Table(1, 2, Theme.Bg);
+            left.Margin = new Padding(0, 0, 14, 0);
+            left.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            left.RowStyles.Add(new RowStyle(SizeType.Absolute, 250F));
+            left.Controls.Add(card, 0, 0);
+            left.Controls.Add(BuildKeepCard(), 0, 1);
+            body.Controls.Add(left, 0, 0);
             body.Controls.Add(right, 1, 0);
             layout.Controls.Add(header, 0, 0);
-            layout.Controls.Add(body, 0, 1);
+            layout.Controls.Add(ScrollHost(body, 700), 0, 1);
             page.Controls.Add(layout);
             return page;
         }
@@ -3722,6 +4231,7 @@ namespace StopProcessing
             if (isUpdating || updateInstalled) return;
             isUpdating = true;
             checkUpdateButton.Enabled = false;
+            RefreshTrayUpdateItem();
             SetUpdateStatus("Checking for updates\u2026", Theme.Muted);
 
             var th = new Thread(() =>
@@ -3735,6 +4245,7 @@ namespace StopProcessing
                 {
                     isUpdating = false;
                     checkUpdateButton.Enabled = true;
+                    try { RefreshTrayUpdateItem(); } catch { }
                     settings.LastCheck = DateTime.UtcNow;
                     settings.Save();
                     updLastCheck.Text = LastCheckText();
@@ -3752,6 +4263,7 @@ namespace StopProcessing
                     {
                         pendingUpdate = null;
                         installUpdateButton.Enabled = false;
+                        RefreshTrayUpdateItem();
                         navItems[SettingsPage].Badge = false;
                         SetUpdateStatus("You're up to date", Theme.Green);
                         updNotes.Text = info != null && !string.IsNullOrEmpty(info.Notes)
@@ -3762,6 +4274,7 @@ namespace StopProcessing
 
                     pendingUpdate = info;
                     installUpdateButton.Enabled = true;
+                    RefreshTrayUpdateItem();
                     navItems[SettingsPage].Badge = true;
                     SetUpdateStatus("Version " + info.Tag.TrimStart('v', 'V') + " is available", Theme.Blue);
                     updNotes.Text = string.IsNullOrEmpty(info.Notes)
@@ -3771,6 +4284,16 @@ namespace StopProcessing
                     if (!userInitiated && settings.AutoUpdate)
                     {
                         InstallUpdate(true);
+                    }
+                    else if (!userInitiated)
+                    {
+                        // automatic install is off: just let the user know, no pop-up at every start
+                        try
+                        {
+                            tray.ShowBalloonTip(5000, "Update available",
+                                "Vibe Stop Processing " + info.Tag.TrimStart('v', 'V') + " is available. Open Settings or the tray menu to install it.", ToolTipIcon.Info);
+                        }
+                        catch { }
                     }
                     else
                     {
@@ -3794,6 +4317,7 @@ namespace StopProcessing
             installUpdateButton.Enabled = false;
             updProgress.Maximum = 100;
             updProgress.Value = 0;
+            RefreshTrayUpdateItem();
             SetUpdateStatus("Downloading " + info.Tag + "\u2026", Theme.Blue);
 
             var th = new Thread(() =>
@@ -3814,10 +4338,13 @@ namespace StopProcessing
                     if (error != null)
                     {
                         installUpdateButton.Enabled = true;
+                        RefreshTrayUpdateItem();
                         SetUpdateStatus("Update failed", Theme.Red);
                         updNotes.Text = error;
                         if (!automatic)
                             ThemedDialog.Show(this, "Update failed", error, new[] { "OK" }, 0, Theme.Red);
+                        else
+                            try { tray.ShowBalloonTip(5000, "Update failed", error.Length > 200 ? error.Substring(0, 200) : error, ToolTipIcon.Warning); } catch { }
                         return;
                     }
 
@@ -3825,6 +4352,9 @@ namespace StopProcessing
                     navItems[SettingsPage].Badge = false;
                     updProgress.Value = 100;
                     SetUpdateStatus("Update installed \u2014 restart to finish", Theme.Green);
+                    installUpdateButton.Text = "Restart Now";
+                    installUpdateButton.Enabled = true;
+                    RefreshTrayUpdateItem();
 
                     if (isStopping || isCleaning) return; // don't interrupt a running job
 
@@ -3848,6 +4378,562 @@ namespace StopProcessing
         }
 
         // =================================================================
+
+        // =================================================================
+        //  Extra tools: Startup Manager, Scheduled Shutdown, Big Files Finder,
+        //  Uninstall Leftovers, Stop All keep list, clean on shutdown, alerts
+        // =================================================================
+
+        private void ShowStartupManager()
+        {
+            if (!Visible) ShowFromTray(-1);
+            using (var f = new StartupManagerForm(line => AddLog(toolsLog, line)))
+                f.ShowDialog(this);
+        }
+
+        private void ShowBigFiles()
+        {
+            if (!Visible) ShowFromTray(-1);
+            using (var f = new BigFilesForm(line => AddLog(toolsLog, line)))
+                f.ShowDialog(this);
+            RefreshPcInfo();
+        }
+
+        private void ShowLeftovers()
+        {
+            if (!Visible) ShowFromTray(-1);
+            using (var f = new LeftoversForm(line => AddLog(toolsLog, line)))
+                f.ShowDialog(this);
+            RefreshPcInfo();
+        }
+
+        private void ShowAppUninstaller()
+        {
+            if (!Visible) ShowFromTray(-1);
+            using (var f = new AppUninstallerForm(line => AddLog(toolsLog, line)))
+                f.ShowDialog(this);
+            RefreshPcInfo();
+        }
+
+        /// Hosts a page body so it scrolls instead of being cut off when the window is small.
+        private static Control ScrollHost(Control content, int minHeight)
+        {
+            var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Margin = new Padding(0), Padding = new Padding(0) };
+            content.Dock = DockStyle.None;
+            content.Margin = new Padding(0);
+            host.Controls.Add(content);
+            EventHandler fit = (s, e) =>
+            {
+                bool scroll = host.Height < minHeight;
+                int w = Math.Max(0, host.Width - (scroll ? SystemInformation.VerticalScrollBarWidth : 0));
+                int h = scroll ? minHeight : host.Height;
+                Point p = scroll ? host.AutoScrollPosition : Point.Empty;
+                if (content.Width != w || content.Height != h || content.Left != p.X || content.Top != p.Y)
+                    content.Bounds = new Rectangle(p.X, p.Y, w, h);
+            };
+            host.Resize += fit;
+            host.HandleCreated += (s, e) => { Native.DarkScroll(host); fit(s, e); };
+            return host;
+        }
+
+        // ---- tray balloons that do something when clicked
+
+        private Action balloonAction;
+        private string balloonTitle;
+
+        private void ShowBalloon(int ms, string title, string text, ToolTipIcon icon, Action onClick)
+        {
+            try
+            {
+                balloonTitle = title;
+                balloonAction = onClick;
+                tray.ShowBalloonTip(ms, title, text, icon);
+            }
+            catch { }
+        }
+
+        private void SetTrayText(string s)
+        {
+            try { tray.Text = s.Length > 63 ? s.Substring(0, 63) : s; } catch { }
+        }
+
+        // ---- Scheduled Shutdown (in-app timer; nothing is saved across restarts)
+
+        private DateTime? schedAt;
+        private bool schedClean, schedStopAll, schedWarned;
+        private System.Windows.Forms.Timer schedTimer;
+        private ToolStripMenuItem traySchedCancel;
+
+        private void ShowScheduledShutdown()
+        {
+            if (!Visible) ShowFromTray(-1);
+            bool clean = schedAt != null ? schedClean : settings.CleanOnShutdown;
+            using (var f = new ScheduleShutdownForm(() => schedAt, ScheduleShutdown, () => CancelScheduledShutdown(false), clean, schedStopAll))
+                f.ShowDialog(this);
+        }
+
+        private void ScheduleShutdown(DateTime at, bool clean, bool stopAll)
+        {
+            schedAt = at;
+            schedClean = clean;
+            schedStopAll = stopAll;
+            schedWarned = false;
+            if (schedTimer == null)
+            {
+                schedTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+                schedTimer.Tick += (s, e) => ScheduleTick();
+            }
+            schedTimer.Start();
+            if (traySchedCancel != null) traySchedCancel.Visible = true;
+            AddLog(toolsLog, "Shutdown scheduled for " + at.ToString("HH:mm") + (at.Date > DateTime.Today ? " tomorrow" : "") +
+                             (clean ? ", clean first" : "") + (stopAll ? ", stop all apps first" : "") + ".");
+            ScheduleTick();
+        }
+
+        private void CancelScheduledShutdown(bool fromTray)
+        {
+            if (schedAt == null) return;
+            schedAt = null;
+            if (schedTimer != null) schedTimer.Stop();
+            if (traySchedCancel != null) traySchedCancel.Visible = false;
+            SetTrayText("Vibe Stop Processing");
+            AddLog(toolsLog, "Scheduled shutdown cancelled.");
+            if (fromTray) ShowBalloon(4000, "Shutdown cancelled", "The scheduled shutdown was cancelled.", ToolTipIcon.Info, null);
+        }
+
+        private void ScheduleTick()
+        {
+            if (schedAt == null)
+            {
+                if (schedTimer != null) schedTimer.Stop();
+                return;
+            }
+            TimeSpan left = schedAt.Value - DateTime.Now;
+            if (left.TotalSeconds <= 0)
+            {
+                bool clean = schedClean, stopAll = schedStopAll;
+                schedAt = null;
+                schedTimer.Stop();
+                if (traySchedCancel != null) traySchedCancel.Visible = false;
+                SetTrayText("Vibe Stop Processing");
+                AddLog(toolsLog, "Scheduled shutdown: shutting down now.");
+                if (stopAll && !isStopping) StartStopAll(() => DoFullShutdown(clean));
+                else DoFullShutdown(clean);
+                return;
+            }
+            SetTrayText("Vibe Stop Processing \u2014 shutdown in " + ScheduleShutdownForm.Fmt(left));
+            if (!schedWarned && left.TotalSeconds <= 60)
+            {
+                schedWarned = true;
+                ShowBalloon(15000, "Shutting down in 1 minute",
+                    "Your PC will shut down in about 60 seconds. Click here to cancel.", ToolTipIcon.Warning,
+                    () => CancelScheduledShutdown(true));
+            }
+        }
+
+        // ---- full shutdown, optionally after a quick silent clean (at most 60 seconds)
+
+        private class StopFlag { public volatile bool Stop; }
+        private volatile bool preShutdownClean;
+
+        private void DoFullShutdown(bool clean)
+        {
+            int code;
+            if (preShutdownClean) return; // already cleaning and shutting down
+            if (!clean || isCleaning)
+            {
+                Native.Run("shutdown.exe", "/s /f /t 0", out code);
+                return;
+            }
+            preShutdownClean = true;
+            var busy = new BusyForm("Cleaning before shutdown", "Removing temporary files\u2026");
+            try { if (Visible) busy.Show(this); else busy.Show(); } catch { }
+            var targets = cleanTargets.Where(x => x.DefaultOn && !x.Recycle).ToList();
+            var th = new Thread(() =>
+            {
+                var flag = new StopFlag();
+                long freed = 0;
+                var worker = new Thread(() =>
+                {
+                    try { freed = SilentClean(targets, flag, (d, n) => Ui(() => busy.SetProgress(d, n))); }
+                    catch { }
+                });
+                worker.IsBackground = true;
+                worker.Start();
+                if (!worker.Join(60000)) { flag.Stop = true; worker.Join(3000); }
+                long fr = freed;
+                bool capped = flag.Stop;
+                Ui(() =>
+                {
+                    AddLog(powerLog, "Clean before shutdown: freed " + Theme.FormatBytes(fr) + (capped ? " (stopped at the 60-second limit)" : "") + ".");
+                    busy.SetText("Shutting down\u2026");
+                });
+                int c;
+                Native.Run("shutdown.exe", "/s /f /t 0", out c);
+                Ui(() =>
+                {
+                    preShutdownClean = false;
+                    try { busy.Close(); busy.Dispose(); } catch { }
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        /// The Cleaner's delete path without the UI: every file goes through
+        /// Native.SafeDeleteUnder with the real (FinalPath) root of its folder.
+        private static long SilentClean(List<CleanTarget> targets, StopFlag flag, Action<int, int> progress)
+        {
+            var work = new List<KeyValuePair<CleanTarget, List<string>>>();
+            var dirWork = new Dictionary<CleanTarget, List<string>>();
+            int total = 0;
+            foreach (var t in targets)
+            {
+                if (flag.Stop) break;
+                var files = new List<string>();
+                var dirs = new List<string>();
+                if (!t.Recycle) foreach (var d in t.Dirs) Walk(d, t.Pattern, files, dirs);
+                work.Add(new KeyValuePair<CleanTarget, List<string>>(t, files));
+                dirWork[t] = dirs;
+                total += files.Count;
+            }
+            if (progress != null) progress(0, total);
+
+            long freed = 0;
+            int done = 0;
+            foreach (var kv in work)
+            {
+                if (flag.Stop) break;
+                var roots = new List<KeyValuePair<string, string>>();
+                foreach (var d in kv.Key.Dirs)
+                {
+                    string fp = null;
+                    try { if (Directory.Exists(d)) fp = Native.FinalPath(d); } catch { }
+                    if (fp != null) roots.Add(new KeyValuePair<string, string>(Path.GetFullPath(d).TrimEnd('\\') + "\\", fp));
+                }
+                foreach (var f in kv.Value)
+                {
+                    if (flag.Stop) break;
+                    done++;
+                    try
+                    {
+                        if (!File.Exists(f)) continue;
+                        string rootFinal = null;
+                        foreach (var r in roots)
+                            if (f.StartsWith(r.Key, StringComparison.OrdinalIgnoreCase)) { rootFinal = r.Value; break; }
+                        long len;
+                        if (rootFinal != null && Native.SafeDeleteUnder(rootFinal, f, out len)) freed += len;
+                    }
+                    catch { } // in use: skipped
+                    if (done % 100 == 0 && progress != null) progress(done, total);
+                }
+                foreach (var d in dirWork[kv.Key].OrderByDescending(x => x.Length))
+                {
+                    if (flag.Stop) break;
+                    try { Directory.Delete(d, false); } catch { }
+                }
+            }
+            if (progress != null) progress(total, total);
+            return freed;
+        }
+
+        // ---- Stop All keep list (settings.ini: KeepApps=name1;name2)
+
+        private volatile HashSet<string> keepSet;
+        private ListBox keepListBox;
+        private TextBox keepInput;
+
+        private static string KeepName(string n)
+        {
+            n = (n ?? "").Replace(";", "").Replace("=", "").Replace("\r", "").Replace("\n", "").Trim();
+            if (n.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) n = n.Substring(0, n.Length - 4).Trim();
+            return n;
+        }
+
+        private List<string> KeepList()
+        {
+            var list = new List<string>();
+            foreach (var p in (settings.KeepApps ?? "").Split(';'))
+            {
+                string n = KeepName(p);
+                if (n.Length > 0 && !list.Any(x => x.Equals(n, StringComparison.OrdinalIgnoreCase))) list.Add(n);
+            }
+            return list;
+        }
+
+        private HashSet<string> KeepSet
+        {
+            get
+            {
+                var k = keepSet;
+                if (k == null)
+                {
+                    k = new HashSet<string>(KeepList(), StringComparer.OrdinalIgnoreCase);
+                    keepSet = k;
+                }
+                return k;
+            }
+        }
+
+        private bool InKeepList(string name)
+        {
+            return !string.IsNullOrEmpty(name) && KeepSet.Contains(KeepName(name));
+        }
+
+        /// Stop All never stops these. The app itself is always kept.
+        private bool IsKept(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (name.Equals("StopProcessing", StringComparison.OrdinalIgnoreCase)) return true;
+            return InKeepList(name);
+        }
+
+        private void SaveKeepList(List<string> list)
+        {
+            settings.KeepApps = string.Join(";", list.ToArray());
+            settings.Save();
+            keepSet = null;
+            RefreshKeepUi();
+            RefreshGrid();
+        }
+
+        private void AddKeep(string name)
+        {
+            string n = KeepName(name);
+            if (n.Length == 0) return;
+            var list = KeepList();
+            if (list.Any(x => x.Equals(n, StringComparison.OrdinalIgnoreCase))) return;
+            list.Add(n);
+            SaveKeepList(list);
+        }
+
+        private void RemoveKeep(string name)
+        {
+            string n = KeepName(name);
+            var list = KeepList();
+            list.RemoveAll(x => x.Equals(n, StringComparison.OrdinalIgnoreCase));
+            SaveKeepList(list);
+        }
+
+        private void RefreshKeepUi()
+        {
+            if (keepListBox == null) return;
+            keepListBox.BeginUpdate();
+            keepListBox.Items.Clear();
+            foreach (var n in KeepList()) keepListBox.Items.Add(n);
+            keepListBox.EndUpdate();
+        }
+
+        private Control BuildKeepCard()
+        {
+            var card = new Card { Dock = DockStyle.Fill, Padding = new Padding(22, 16, 22, 14) };
+            var t = Table(1, 4, Theme.Card);
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 22F));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            var hint = MakeLabel("Stop All never stops these apps (process names). Vibe Stop Processing itself is always kept.",
+                Theme.F(8.5f), Theme.Muted, ContentAlignment.TopLeft);
+
+            var row = Table(3, 1, Theme.Card);
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96F));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170F));
+            var inputHost = new Panel { Dock = DockStyle.Top, Height = 38, BackColor = Theme.Inset, Margin = new Padding(0, 7, 8, 0) };
+            keepInput = new TextBox
+            {
+                BorderStyle = BorderStyle.None, BackColor = Theme.Inset, ForeColor = Theme.Text,
+                Font = Theme.F(10f), Location = new Point(10, 9), Width = 100
+            };
+            inputHost.Controls.Add(keepInput);
+            inputHost.Resize += (s, e) => keepInput.Width = Math.Max(20, inputHost.Width - 20);
+            inputHost.Click += (s, e) => keepInput.Focus();
+
+            var add = new FlatButton { Text = "Add", Glyph = "\uE710", Dock = DockStyle.Top, Height = 38, Margin = new Padding(0, 7, 8, 0), Font = Theme.Semi(9.5f) };
+            add.SetColor(Theme.Blue);
+            Action addNow = () =>
+            {
+                string n = KeepName(keepInput.Text);
+                if (n.Length == 0) return;
+                AddKeep(n);
+                keepInput.Text = "";
+                AddLog(stopLog, n + " added to the keep list.");
+            };
+            add.Click += (s, e) => addNow();
+            keepInput.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; addNow(); } };
+
+            var remove = new FlatButton { Text = "Remove selected", Glyph = "\uE738", Dock = DockStyle.Top, Height = 38, Margin = new Padding(0, 7, 0, 0), Font = Theme.Semi(9.5f) };
+            remove.SetColor(Theme.Secondary);
+            Action removeNow = () =>
+            {
+                if (keepListBox.SelectedItem == null) return;
+                string n = Convert.ToString(keepListBox.SelectedItem);
+                RemoveKeep(n);
+                AddLog(stopLog, n + " removed from the keep list.");
+            };
+            remove.Click += (s, e) => removeNow();
+
+            row.Controls.Add(inputHost, 0, 0);
+            row.Controls.Add(add, 1, 0);
+            row.Controls.Add(remove, 2, 0);
+
+            keepListBox = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Theme.Inset,
+                ForeColor = Theme.Soft,
+                BorderStyle = BorderStyle.None,
+                Font = Theme.F(9.5f),
+                IntegralHeight = false,
+                DrawMode = DrawMode.OwnerDrawFixed,
+                ItemHeight = 26,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            keepListBox.HandleCreated += (s, e) => Native.DarkScroll(keepListBox);
+            keepListBox.DrawItem += (s, e) =>
+            {
+                if (e.Index < 0) return;
+                bool sel = (e.State & DrawItemState.Selected) != 0;
+                using (var b = new SolidBrush(sel ? Color.FromArgb(40, 52, 74) : Theme.Inset))
+                    e.Graphics.FillRectangle(b, e.Bounds);
+                TextRenderer.DrawText(e.Graphics, Convert.ToString(keepListBox.Items[e.Index]), Theme.F(9.5f),
+                    new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 14, e.Bounds.Height), sel ? Color.White : Theme.Soft,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            };
+            keepListBox.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete) removeNow(); };
+
+            t.Controls.Add(MakeLabel("Stop All keep list", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
+            t.Controls.Add(hint, 0, 1);
+            t.Controls.Add(row, 0, 2);
+            t.Controls.Add(keepListBox, 0, 3);
+            card.Controls.Add(t);
+            RefreshKeepUi();
+            return card;
+        }
+
+        /// Clean on shutdown + resource alert settings, added under the General card's toggles.
+        private void AddGeneralExtras(TableLayoutPanel gt)
+        {
+            var cleanToggle = new CheckToggle { Text = "Clean temp files before shutting down", Dock = DockStyle.Fill, Checked = settings.CleanOnShutdown };
+            cleanToggle.CheckedChanged += (s, e) => { settings.CleanOnShutdown = cleanToggle.Checked; settings.Save(); };
+
+            var ramToggle = new CheckToggle { Text = "Alert when an app uses a lot of RAM", Dock = DockStyle.Fill, Checked = settings.AlertRam };
+            ramToggle.CheckedChanged += (s, e) => { settings.AlertRam = ramToggle.Checked; settings.Save(); };
+
+            var limitRow = Table(4, 1, Theme.Card);
+            limitRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            for (int i = 0; i < 3; i++) limitRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 54F));
+            var limitLabel = MakeLabel("RAM alert limit", Theme.F(9f), Theme.Muted);
+            limitLabel.Padding = new Padding(26, 0, 0, 0);
+            limitRow.Controls.Add(limitLabel, 0, 0);
+            var limitButtons = new List<FlatButton>();
+            int[] choices = { 1, 2, 4 };
+            for (int i = 0; i < choices.Length; i++)
+            {
+                int gb = choices[i];
+                var b = new FlatButton { Text = gb + " GB", Dock = DockStyle.Fill, Margin = new Padding(4, 3, 0, 3), Font = Theme.Semi(8.5f), Radius = 6, Tag = gb };
+                b.SetColor(gb == settings.AlertRamGb ? Theme.Blue : Theme.Secondary);
+                b.Click += (s, e) =>
+                {
+                    settings.AlertRamGb = gb;
+                    settings.Save();
+                    foreach (var x in limitButtons) x.SetColor((int)x.Tag == gb ? Theme.Blue : Theme.Secondary);
+                };
+                limitButtons.Add(b);
+                limitRow.Controls.Add(b, i + 1, 0);
+            }
+
+            var cpuToggle = new CheckToggle { Text = "Alert when an app uses over 80% CPU", Dock = DockStyle.Fill, Checked = settings.AlertCpu };
+            cpuToggle.CheckedChanged += (s, e) => { settings.AlertCpu = cpuToggle.Checked; settings.Save(); };
+
+            gt.Controls.Add(cleanToggle, 0, 3);
+            gt.Controls.Add(ramToggle, 0, 4);
+            gt.Controls.Add(limitRow, 0, 5);
+            gt.Controls.Add(cpuToggle, 0, 6);
+        }
+
+        // ---- resource alerts: a background check every 10 seconds
+
+        private System.Threading.Timer alertTimer;
+        private int alertBusy;
+        private class CpuSample { public DateTime T; public TimeSpan Cpu; }
+        private readonly Dictionary<int, List<CpuSample>> alertCpu = new Dictionary<int, List<CpuSample>>();
+        private readonly Dictionary<string, DateTime> alertLast = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        private void StartAlerts()
+        {
+            alertTimer = new System.Threading.Timer(_ => CheckResources(), null, 15000, 10000);
+        }
+
+        private void CheckResources()
+        {
+            if (Interlocked.Exchange(ref alertBusy, 1) == 1) return;
+            try
+            {
+                if (IsDisposed) return;
+                bool ram = settings.AlertRam, cpu = settings.AlertCpu;
+                if (!ram && !cpu) { alertCpu.Clear(); return; }
+                long limit = settings.AlertRamGb * 1024L * 1024L * 1024L;
+                var now = DateTime.UtcNow;
+                var alive = new HashSet<int>();
+                foreach (var p in Process.GetProcesses())
+                {
+                    try
+                    {
+                        int pid = p.Id;
+                        alive.Add(pid);
+                        if (pid <= 4 || pid == myPid) continue;
+                        int session = -1;
+                        try { session = p.SessionId; } catch { }
+                        if (session != mySession) continue;
+                        string name = p.ProcessName;
+                        string path;
+                        if (!pathCache.TryGetValue(pid, out path)) path = ExePath(pid);
+                        if (IsProtected(new ProcRow { Pid = pid, Name = name, Path = path, Session = session })) continue;
+
+                        if (ram)
+                        {
+                            long mem = 0;
+                            try { mem = p.WorkingSet64; } catch { }
+                            if (mem > limit)
+                                Alert(name, "High memory use", name + " is using " + Theme.FormatBytes(mem) + " of RAM.", now);
+                        }
+                        if (cpu)
+                        {
+                            TimeSpan used;
+                            try { used = p.TotalProcessorTime; } catch { continue; }
+                            List<CpuSample> list;
+                            if (!alertCpu.TryGetValue(pid, out list)) { list = new List<CpuSample>(); alertCpu[pid] = list; }
+                            list.Add(new CpuSample { T = now, Cpu = used });
+                            // keep the newest sample that is at least 30 seconds old at the front
+                            while (list.Count >= 2 && (now - list[1].T).TotalSeconds >= 30) list.RemoveAt(0);
+                            double span = (now - list[0].T).TotalMilliseconds;
+                            if (span >= 29000)
+                            {
+                                double pct = (used - list[0].Cpu).TotalMilliseconds / span * 100.0 / Environment.ProcessorCount;
+                                if (pct > 80)
+                                    Alert(name, "High CPU use", name + " has used about " + Math.Min(100, pct).ToString("0") + "% CPU for the last 30 seconds.", now);
+                            }
+                        }
+                    }
+                    catch { }
+                    finally { p.Dispose(); }
+                }
+                foreach (var dead in alertCpu.Keys.Where(k => !alive.Contains(k)).ToList()) alertCpu.Remove(dead);
+            }
+            catch { }
+            finally { Interlocked.Exchange(ref alertBusy, 0); }
+        }
+
+        /// At most one alert per process name every 30 minutes.
+        private void Alert(string name, string title, string text, DateTime now)
+        {
+            DateTime last;
+            if (alertLast.TryGetValue(name, out last) && (now - last).TotalMinutes < 30) return;
+            alertLast[name] = now;
+            Ui(() => ShowBalloon(8000, title, text + " Click to open Processes.", ToolTipIcon.Warning, () => ShowFromTray(0)));
+        }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -3876,6 +4962,8 @@ namespace StopProcessing
             }
             if (stopCancel != null) stopCancel.Cancel();
             if (refreshTimer != null) refreshTimer.Stop();
+            if (alertTimer != null) { try { alertTimer.Dispose(); } catch { } }
+            if (schedTimer != null) schedTimer.Stop();
             if (tray != null) { tray.Visible = false; tray.Dispose(); }
             base.OnFormClosing(e);
         }
@@ -3892,6 +4980,26 @@ namespace StopProcessing
         }
 
         private static Mutex singleInstance;
+        private static int crashShown;
+
+        /// Writes the error to error.log in the app's data folder and tells the user once.
+        private static void ReportCrash(Exception ex, bool fatal)
+        {
+            try
+            {
+                File.AppendAllText(Path.Combine(AppInfo.DataDir, "error.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  v" + AppInfo.VersionText + "  " + (ex == null ? "unknown error" : ex.ToString()) + "\r\n\r\n");
+            }
+            catch { }
+            if (Interlocked.Exchange(ref crashShown, 1) == 1 && !fatal) return;
+            try
+            {
+                MessageBox.Show((fatal ? "Vibe Stop Processing has to close because of an unexpected error." : "Something went wrong, but the app keeps running.") +
+                    "\n\n" + (ex == null ? "" : ex.Message) + "\n\nDetails were saved to error.log in " + AppInfo.DataDir + ".",
+                    "Vibe Stop Processing", MessageBoxButtons.OK, fatal ? MessageBoxIcon.Error : MessageBoxIcon.Warning);
+            }
+            catch { }
+        }
 
         [STAThread]
         static void Main()
@@ -3910,6 +5018,10 @@ namespace StopProcessing
                 Native.PostMessage((IntPtr)0xffff, WM_SHOWME, IntPtr.Zero, IntPtr.Zero);
                 return;
             }
+
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) => ReportCrash(e.Exception, false);
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => ReportCrash(e.ExceptionObject as Exception, e.IsTerminating);
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -4067,7 +5179,91 @@ namespace StopProcessing
                     return "This folder contains important Windows or user folders.";
             }
             if (f.StartsWith(win + "\\", StringComparison.OrdinalIgnoreCase)) return "Files inside the Windows folder are protected.";
+
+            // Windows parts that live outside C:\Windows
+            string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            string pd = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            var systemParts = new List<string>();
+            foreach (var basePath in new[] { pf, pf86 })
+            {
+                if (string.IsNullOrEmpty(basePath)) continue;
+                foreach (var n in new[] { "WindowsApps", "Common Files", "Windows Defender", "Windows Defender Advanced Threat Protection", "Windows NT",
+                                          "Windows Mail", "Windows Media Player", "Windows Photo Viewer", "Windows Portable Devices", "Windows Security",
+                                          "Windows Sidebar", "WindowsPowerShell", "Microsoft Update Health Tools", "ModifiableWindowsApps", "Internet Explorer" })
+                    systemParts.Add(Path.Combine(basePath, n));
+            }
+            if (!string.IsNullOrEmpty(pd)) systemParts.Add(Path.Combine(pd, "Microsoft"));
+            foreach (var sp in systemParts)
+            {
+                if (string.Equals(f, sp, StringComparison.OrdinalIgnoreCase) || f.StartsWith(sp + "\\", StringComparison.OrdinalIgnoreCase))
+                    return "This is part of Windows.";
+            }
+
+            // another person's user folder on this PC
+            string users = Path.GetDirectoryName(profile);
+            if (!string.IsNullOrEmpty(users) && f.StartsWith(users.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase) &&
+                !f.StartsWith(profile.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
+            {
+                string rest = f.Substring(users.TrimEnd('\\').Length + 1);
+                string owner = rest.Split('\\')[0];
+                if (!owner.Equals("Public", StringComparison.OrdinalIgnoreCase)) return "This belongs to another user of this PC.";
+            }
             return null;
+        }
+
+        /// Turns a FinalPath result ("\\?\C:\..." or "\\?\UNC\server\share") back into a normal path.
+        public static string PlainPath(string finalPath)
+        {
+            if (finalPath == null) return null;
+            if (finalPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) return @"\\" + finalPath.Substring(8);
+            if (finalPath.StartsWith(@"\\?\")) return finalPath.Substring(4);
+            return finalPath;
+        }
+
+        /// The same safety check as Delete Permanently (BlockedReason on the path and on its
+        /// real, link-free path), for the other tools. Null when the path may be removed.
+        public static string SafetyCheck(string full)
+        {
+            if (string.IsNullOrEmpty(full)) return "No path.";
+            string f = full.TrimEnd('\\');
+            string blocked = BlockedReason(f);
+            if (blocked != null) return blocked;
+            string real = PlainPath(Native.FinalPath(f));
+            if (real == null) return "That path can't be opened.";
+            return BlockedReason(real.TrimEnd('\\'));
+        }
+
+        /// True when a path can be pasted into a cmd.exe command safely
+        /// (inside quotes cmd still expands %VAR%, and a quote would end the argument).
+        private static bool CmdSafe(string path)
+        {
+            return path.IndexOf('%') < 0 && path.IndexOf('"') < 0;
+        }
+
+        /// True when the folder tree has a junction or symbolic link anywhere inside.
+        /// Recursive takeown / icacls are not run on such a tree, so a link can
+        /// never carry an ownership change to a folder outside it.
+        private static bool HasLinkInside(string root)
+        {
+            var stack = new Stack<string>();
+            stack.Push(root);
+            int seen = 0;
+            while (stack.Count > 0)
+            {
+                string d = stack.Pop();
+                string[] entries;
+                try { entries = Directory.GetFileSystemEntries(d); } catch { continue; }
+                foreach (var e in entries)
+                {
+                    if (++seen > 500000) return true; // too big to check fully: be safe
+                    FileAttributes a;
+                    try { a = File.GetAttributes(e); } catch { continue; }
+                    if ((a & FileAttributes.ReparsePoint) != 0) return true;
+                    if ((a & FileAttributes.Directory) != 0) stack.Push(e);
+                }
+            }
+            return false;
         }
 
         private string ResolvePath(out string error)
@@ -4080,6 +5276,13 @@ namespace StopProcessing
             catch { error = "That path isn't valid."; return null; }
             if (!File.Exists(full) && !Directory.Exists(full)) { error = "Nothing found at that path."; return null; }
             string blocked = BlockedReason(full);
+            if (blocked == null)
+            {
+                // the same check on the real path: short 8.3 names (C:\PROGRA~1) and links are resolved first
+                string real = PlainPath(Native.FinalPath(full));
+                if (real == null) { error = "That path can't be opened."; return null; }
+                blocked = BlockedReason(real.TrimEnd('\\'));
+            }
             if (blocked != null) { error = "Blocked for safety: " + blocked; return null; }
             return full;
         }
@@ -4237,8 +5440,17 @@ namespace StopProcessing
             int code;
             if (isDir)
             {
-                Native.Run("takeown.exe", "/f \"" + full + "\" /r /d y", out code);
-                Native.Run("icacls.exe", "\"" + full + "\" /grant *S-1-5-32-544:F /t /c /q", out code);
+                if (!HasLinkInside(full))
+                {
+                    Native.Run("takeown.exe", "/f \"" + full + "\" /r /d y", out code, -1);
+                    Native.Run("icacls.exe", "\"" + full + "\" /grant *S-1-5-32-544:F /t /c /q", out code, -1);
+                }
+                else
+                {
+                    // a link inside could lead outside this folder: only this folder itself is unlocked
+                    Native.Run("takeown.exe", "/f \"" + full + "\"", out code);
+                    Native.Run("icacls.exe", "\"" + full + "\" /grant *S-1-5-32-544:F /c /q", out code);
+                }
             }
             else
             {
@@ -4330,6 +5542,7 @@ namespace StopProcessing
         private static void TryDelete(string full, bool isDir, bool keep)
         {
             int code;
+            if (!CmdSafe(full)) { ManagedDelete(full, isDir, keep); return; }
             if (!isDir)
             {
                 Native.Run("cmd.exe", "/c attrib -r -s -h \"" + full + "\"", out code);
@@ -4344,15 +5557,41 @@ namespace StopProcessing
                 try { entries = Directory.GetFileSystemEntries(full); } catch { entries = new string[0]; }
                 foreach (var en in entries)
                 {
-                    if (Directory.Exists(en)) Native.Run("cmd.exe", "/c rd /s /q \"\\\\?\\" + en + "\"", out code);
+                    if (!CmdSafe(en)) { ManagedDelete(en, Directory.Exists(en), false); continue; }
+                    if (Directory.Exists(en)) Native.Run("cmd.exe", "/c rd /s /q \"\\\\?\\" + en + "\"", out code, -1);
                     else Native.Run("cmd.exe", "/c del /f /q /a \"\\\\?\\" + en + "\"", out code);
                 }
             }
             else
             {
                 // the \\?\ prefix handles very deep paths (node_modules) and odd names (trailing dots/spaces)
-                Native.Run("cmd.exe", "/c rd /s /q \"\\\\?\\" + full + "\"", out code);
+                Native.Run("cmd.exe", "/c rd /s /q \"\\\\?\\" + full + "\"", out code, -1);
             }
+        }
+
+        /// Deletes without cmd.exe (for names with % or quotes). Links are removed
+        /// as links, never followed.
+        private static void ManagedDelete(string full, bool isDir, bool keep)
+        {
+            try
+            {
+                if (!isDir) { var fi = new FileInfo(full); if (fi.Exists) { fi.Attributes = FileAttributes.Normal; fi.Delete(); } return; }
+                var di = new DirectoryInfo(full);
+                if (!di.Exists) return;
+                if ((di.Attributes & FileAttributes.ReparsePoint) != 0) { if (!keep) di.Delete(false); return; }
+                foreach (var e in di.GetFileSystemInfos())
+                {
+                    try
+                    {
+                        if ((e.Attributes & FileAttributes.ReparsePoint) != 0) { if (e is DirectoryInfo) ((DirectoryInfo)e).Delete(false); else e.Delete(); continue; }
+                        if (e is DirectoryInfo) ManagedDelete(e.FullName, true, false);
+                        else { e.Attributes = FileAttributes.Normal; e.Delete(); }
+                    }
+                    catch { }
+                }
+                if (!keep) { di.Attributes = FileAttributes.Directory; di.Delete(false); }
+            }
+            catch { }
         }
 
         private static bool IsGone(string full, bool isDir, bool keep)
@@ -4419,9 +5658,9 @@ namespace StopProcessing
             for (int i = 0; i < 16; i++)
             {
                 Thread.Sleep(250);
-                if (Process.GetProcessesByName("explorer").Length > 0) return;
+                if (Native.ShellRunning()) return;
             }
-            try { Process.Start(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe")); } catch { }
+            Native.StartShellUnelevated();
         }
     }
 
@@ -4504,6 +5743,2763 @@ namespace StopProcessing
             }
             finally { RmEndSession(handle); }
             return result;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Shared pieces for the extra tools (Startup Manager, Scheduled
+    //  Shutdown, Big Files Finder, Uninstall Leftovers)
+    // ------------------------------------------------------------------
+
+    /// Moves a file or folder to the Recycle Bin (SHFileOperation with FOF_ALLOWUNDO).
+    static class RecycleBin
+    {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct OpWide
+        {
+            public IntPtr hwnd;
+            public uint wFunc;
+            public string pFrom;
+            public string pTo;
+            public ushort fFlags;
+            public int fAnyOperationsAborted;
+            public IntPtr hNameMappings;
+            public string lpszProgressTitle;
+        }
+
+        // 32-bit Windows packs this structure on 1-byte boundaries
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 1)]
+        private struct OpPacked
+        {
+            public IntPtr hwnd;
+            public uint wFunc;
+            public string pFrom;
+            public string pTo;
+            public ushort fFlags;
+            public int fAnyOperationsAborted;
+            public IntPtr hNameMappings;
+            public string lpszProgressTitle;
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "SHFileOperationW")]
+        private static extern int OpWideCall(ref OpWide op);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "SHFileOperationW")]
+        private static extern int OpPackedCall(ref OpPacked op);
+
+        private const uint FO_DELETE = 3;
+        // FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING
+        // (Windows still warns before deleting something that can't go to the Recycle Bin)
+        private const ushort FLAGS = 0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000;
+
+        /// Returns null when the item is now in the Recycle Bin, otherwise the reason it isn't.
+        public static string Send(string path)
+        {
+            string error = null;
+            var th = new Thread(() =>
+            {
+                try
+                {
+                    int r;
+                    bool aborted;
+                    string from = path + "\0"; // the marshaller adds the second terminating null
+                    if (IntPtr.Size == 8)
+                    {
+                        var op = new OpWide { wFunc = FO_DELETE, pFrom = from, fFlags = FLAGS };
+                        r = OpWideCall(ref op);
+                        aborted = op.fAnyOperationsAborted != 0;
+                    }
+                    else
+                    {
+                        var op = new OpPacked { wFunc = FO_DELETE, pFrom = from, fFlags = FLAGS };
+                        r = OpPackedCall(ref op);
+                        aborted = op.fAnyOperationsAborted != 0;
+                    }
+                    if (r != 0) error = "Windows could not move it (code 0x" + r.ToString("X") + ").";
+                    else if (aborted) error = "The operation was cancelled.";
+                }
+                catch (Exception ex) { error = ex.Message; }
+            });
+            th.SetApartmentState(ApartmentState.STA);
+            th.IsBackground = true;
+            th.Start();
+            th.Join();
+            if (error == null && (File.Exists(path) || Directory.Exists(path))) error = "It is still there (in use or protected).";
+            return error;
+        }
+    }
+
+    /// The dark list style of the Processes grid, for the tool windows.
+    static class DarkGrid
+    {
+        public static DataGridView Create()
+        {
+            var grid = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                BackgroundColor = Theme.Card,
+                BorderStyle = BorderStyle.None,
+                GridColor = Color.FromArgb(38, 43, 51),
+                ReadOnly = true,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                AllowUserToResizeColumns = false,
+                AllowUserToOrderColumns = false,
+                RowHeadersVisible = false,
+                MultiSelect = false,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                ColumnHeadersHeight = 36,
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+                ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None,
+                EnableHeadersVisualStyles = false,
+                CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+                Margin = new Padding(0)
+            };
+            grid.RowTemplate.Height = 30;
+            grid.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Theme.Card,
+                ForeColor = Theme.Faint,
+                Font = Theme.Semi(8.5f),
+                SelectionBackColor = Theme.Card,
+                SelectionForeColor = Theme.Faint,
+                Alignment = DataGridViewContentAlignment.MiddleLeft,
+                Padding = new Padding(8, 0, 8, 0)
+            };
+            grid.DefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Theme.Card,
+                ForeColor = Theme.Soft,
+                SelectionBackColor = Color.FromArgb(40, 52, 74),
+                SelectionForeColor = Color.White,
+                Font = Theme.F(9.5f),
+                Padding = new Padding(8, 0, 8, 0)
+            };
+            grid.AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle { BackColor = Color.FromArgb(32, 36, 44) };
+            try
+            {
+                typeof(DataGridView).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .SetValue(grid, true, null);
+            }
+            catch { }
+            grid.HandleCreated += (s, e) =>
+            {
+                foreach (Control c in grid.Controls)
+                    if (c is ScrollBar) Native.DarkScroll(c);
+            };
+            return grid;
+        }
+
+        public static DataGridViewTextBoxColumn Col(DataGridView grid, string name, string header, int weight, bool right)
+        {
+            var col = new DataGridViewTextBoxColumn
+            {
+                HeaderText = header,
+                Name = name,
+                SortMode = DataGridViewColumnSortMode.NotSortable,
+                FillWeight = weight
+            };
+            if (right)
+            {
+                col.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+                col.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleRight;
+                col.DefaultCellStyle.Font = Theme.Mono(9f);
+            }
+            grid.Columns.Add(col);
+            return col;
+        }
+
+        /// The rounded status pill used in the Processes grid.
+        public static void Pill(DataGridViewCellPaintingEventArgs e, string text, Color c)
+        {
+            e.PaintBackground(e.CellBounds, true);
+            var g = e.Graphics;
+            var f = Theme.Semi(8f);
+            Size ts = TextRenderer.MeasureText(g, text, f, Size.Empty, TextFormatFlags.NoPadding);
+            var pill = new Rectangle(e.CellBounds.X + 8, e.CellBounds.Y + (e.CellBounds.Height - 20) / 2, ts.Width + 18, 20);
+            var old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Theme.FillRound(g, Color.FromArgb(38, c), pill, 10);
+            g.SmoothingMode = old;
+            TextRenderer.DrawText(g, text, f, pill, c,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            e.Handled = true;
+        }
+
+        /// A tick box in a cell, drawn like CheckToggle.
+        public static void Box(DataGridViewCellPaintingEventArgs e, bool on)
+        {
+            e.PaintBackground(e.CellBounds, true);
+            var g = e.Graphics;
+            var old = g.SmoothingMode;
+            CheckToggle.DrawBox(g, new Rectangle(e.CellBounds.X + (e.CellBounds.Width - 18) / 2, e.CellBounds.Y + (e.CellBounds.Height - 18) / 2, 18, 18), on);
+            g.SmoothingMode = old;
+            e.Handled = true;
+        }
+    }
+
+    /// Base for the tool windows: the same frame as Delete Permanently.
+    class ToolDialog : Form
+    {
+        protected readonly Panel Inner;
+        protected readonly int W, H;
+
+        public ToolDialog(string title, string subtitle, Color accent, int w, int h)
+        {
+            W = w;
+            H = h;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            BackColor = Theme.Line;
+            Padding = new Padding(1);
+            KeyPreview = true;
+            Font = Theme.F(9f);
+            ForeColor = Theme.Text;
+            ClientSize = new Size(w, h);
+
+            Inner = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Surface };
+            Inner.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) Native.DragWindow(this); };
+            Controls.Add(Inner);
+            Inner.Controls.Add(new Panel { BackColor = accent, Bounds = new Rectangle(0, 0, w - 2, 3) });
+            Inner.Controls.Add(new Label { Text = title, Font = Theme.F(13f, FontStyle.Bold), ForeColor = Theme.Text, AutoSize = true, Location = new Point(24, 22), UseMnemonic = false });
+            Inner.Controls.Add(new Label
+            {
+                Text = subtitle, Font = Theme.F(9.5f), ForeColor = Theme.Muted, Bounds = new Rectangle(25, 56, w - 52, 22),
+                UseMnemonic = false, AutoEllipsis = true
+            });
+            KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape && CanClose()) Close(); };
+        }
+
+        protected virtual bool CanClose() { return true; }
+
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.ClassStyle |= 0x20000; return cp; }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!CanClose()) { e.Cancel = true; return; }
+            base.OnFormClosing(e);
+        }
+
+        protected void Post(Action a)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(a); } catch { }
+        }
+
+        protected Label AddCaption(string text, int x, int y, int w)
+        {
+            var l = new Label { Text = text, Font = Theme.Semi(8f), ForeColor = Theme.Faint, Bounds = new Rectangle(x, y, w, 18), UseMnemonic = false };
+            Inner.Controls.Add(l);
+            return l;
+        }
+
+        protected Label AddText(string text, Rectangle b, Font f, Color c)
+        {
+            var l = new Label { Text = text, Font = f, ForeColor = c, Bounds = b, UseMnemonic = false, AutoEllipsis = true };
+            Inner.Controls.Add(l);
+            return l;
+        }
+
+        protected FlatButton AddButton(string text, string glyph, Color color, Rectangle b, Action click)
+        {
+            var btn = new FlatButton { Text = text, Glyph = glyph, Bounds = b, Font = Theme.Semi(9.5f) };
+            btn.SetColor(color);
+            if (click != null) btn.Click += (s, e) => click();
+            Inner.Controls.Add(btn);
+            return btn;
+        }
+
+        protected static TextBox MakeInput(Control parent, Rectangle b, string text)
+        {
+            var host = new Panel { BackColor = Theme.Inset, Bounds = b };
+            var box = new TextBox
+            {
+                BorderStyle = BorderStyle.None, BackColor = Theme.Inset, ForeColor = Theme.Text,
+                Font = Theme.F(10f), Bounds = new Rectangle(10, (b.Height - 18) / 2, b.Width - 20, 22), Text = text ?? ""
+            };
+            host.Controls.Add(box);
+            host.Click += (s, e) => box.Focus();
+            parent.Controls.Add(host);
+            return box;
+        }
+
+        protected TextBox AddInput(Rectangle b, string text)
+        {
+            return MakeInput(Inner, b, text);
+        }
+
+        protected DataGridView AddGrid(Rectangle b)
+        {
+            var card = new Card { Bounds = b, Padding = new Padding(10, 8, 10, 8) };
+            var grid = DarkGrid.Create();
+            card.Controls.Add(grid);
+            Inner.Controls.Add(card);
+            return grid;
+        }
+    }
+
+    /// Small "working..." window (used for the clean before shutdown).
+    class BusyForm : Form
+    {
+        private readonly Label text;
+        private readonly SlimBar bar;
+
+        public BusyForm(string title, string message)
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            ShowInTaskbar = false;
+            TopMost = true;
+            BackColor = Theme.Line;
+            Padding = new Padding(1);
+            ClientSize = new Size(420, 136);
+
+            var inner = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Surface };
+            inner.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) Native.DragWindow(this); };
+            Controls.Add(inner);
+            inner.Controls.Add(new Panel { BackColor = Theme.Blue, Bounds = new Rectangle(0, 0, 418, 3) });
+            inner.Controls.Add(new Label { Text = title, Font = Theme.F(12.5f, FontStyle.Bold), ForeColor = Theme.Text, AutoSize = true, Location = new Point(24, 22), UseMnemonic = false });
+            text = new Label { Text = message, Font = Theme.F(9.5f), ForeColor = Theme.Soft, Bounds = new Rectangle(25, 60, 370, 22), UseMnemonic = false, AutoEllipsis = true };
+            inner.Controls.Add(text);
+            bar = new SlimBar { Bounds = new Rectangle(24, 98, 370, 8) };
+            inner.Controls.Add(bar);
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.ClassStyle |= 0x20000; return cp; }
+        }
+
+        public void SetText(string s)
+        {
+            if (!IsDisposed) text.Text = s;
+        }
+
+        public void SetProgress(int done, int total)
+        {
+            if (IsDisposed) return;
+            bar.Maximum = Math.Max(1, total);
+            bar.Value = done;
+            text.Text = "Removing temporary files\u2026 " + done.ToString("N0") + " / " + total.ToString("N0");
+        }
+    }
+
+    // ---------------- Startup Manager ----------------
+
+    class StartupEntry
+    {
+        public string Name, Command, Location, ValueName, ApprovedKey;
+        public RegistryHive Hive;
+        public bool Enabled;
+    }
+
+    /// Programs that start with Windows (Run keys and Startup folders). They are
+    /// turned on and off the way Task Manager does it: a value under
+    /// Explorer\StartupApproved in the same hive. Nothing is ever deleted.
+    static class StartupItems
+    {
+        private const string RunKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+        private const string RunKey32 = @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
+        private const string Approved = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\";
+
+        private static RegistryKey Base(RegistryHive hive)
+        {
+            return RegistryKey.OpenBaseKey(hive, Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default);
+        }
+
+        public static List<StartupEntry> Load()
+        {
+            var list = new List<StartupEntry>();
+            ReadRun(list, RegistryHive.CurrentUser, RunKey, "Run", "Registry (this user)");
+            ReadRun(list, RegistryHive.LocalMachine, RunKey, "Run", "Registry (all users)");
+            if (Environment.Is64BitOperatingSystem)
+                ReadRun(list, RegistryHive.LocalMachine, RunKey32, "Run32", "Registry (all users, 32-bit)");
+            ReadFolder(list, RegistryHive.CurrentUser, Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Startup folder (this user)");
+            ReadFolder(list, RegistryHive.LocalMachine, Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "Startup folder (all users)");
+            return list;
+        }
+
+        /// This app starts through its own scheduled task; it is never listed or changed here.
+        private static bool IsSelf(string name, string cmd)
+        {
+            string all = (name ?? "") + " " + (cmd ?? "");
+            string me = Application.ExecutablePath;
+            return (!string.IsNullOrEmpty(me) && all.IndexOf(me, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                   all.IndexOf("StopProcessing.exe", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   all.IndexOf("VibeStopProcessing", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static void ReadRun(List<StartupEntry> list, RegistryHive hive, string path, string approvedName, string location)
+        {
+            try
+            {
+                using (var b = Base(hive))
+                using (var k = b.OpenSubKey(path))
+                {
+                    if (k == null) return;
+                    foreach (var n in k.GetValueNames())
+                    {
+                        if (string.IsNullOrEmpty(n)) continue;
+                        string cmd = Convert.ToString(k.GetValue(n, "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                        if (IsSelf(n, cmd)) continue;
+                        string key = Approved + approvedName;
+                        list.Add(new StartupEntry
+                        {
+                            Name = n, Command = cmd, Location = location, ValueName = n,
+                            Hive = hive, ApprovedKey = key, Enabled = ReadEnabled(hive, key, n)
+                        });
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void ReadFolder(List<StartupEntry> list, RegistryHive hive, string dir, string location)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+                foreach (var f in Directory.GetFiles(dir))
+                {
+                    string file = Path.GetFileName(f);
+                    FileAttributes a;
+                    try { a = File.GetAttributes(f); } catch { continue; }
+                    if ((a & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue; // desktop.ini
+                    if (file.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
+                    string target = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) ? ShortcutTarget(f) : f;
+                    if (IsSelf(file, target)) continue;
+                    string key = Approved + "StartupFolder";
+                    list.Add(new StartupEntry
+                    {
+                        Name = Path.GetFileNameWithoutExtension(file), Command = string.IsNullOrEmpty(target) ? f : target,
+                        Location = location, ValueName = file, Hive = hive, ApprovedKey = key, Enabled = ReadEnabled(hive, key, file)
+                    });
+                }
+            }
+            catch { }
+        }
+
+        /// The target of a .lnk file, read through the WScript.Shell COM object (no extra references needed).
+        private static string ShortcutTarget(string lnk)
+        {
+            object shell = null, sc = null;
+            try
+            {
+                var t = Type.GetTypeFromProgID("WScript.Shell");
+                if (t == null) return null;
+                shell = Activator.CreateInstance(t);
+                sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
+                string target = Convert.ToString(sc.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, sc, null));
+                string args = Convert.ToString(sc.GetType().InvokeMember("Arguments", BindingFlags.GetProperty, null, sc, null));
+                return (target + (string.IsNullOrEmpty(args) ? "" : " " + args)).Trim();
+            }
+            catch { return null; }
+            finally
+            {
+                try { if (sc != null) Marshal.ReleaseComObject(sc); } catch { }
+                try { if (shell != null) Marshal.ReleaseComObject(shell); } catch { }
+            }
+        }
+
+        private static bool ReadEnabled(RegistryHive hive, string key, string value)
+        {
+            try
+            {
+                using (var b = Base(hive))
+                using (var k = b.OpenSubKey(key))
+                {
+                    var data = k == null ? null : k.GetValue(value) as byte[];
+                    if (data == null || data.Length == 0) return true; // no entry = on
+                    return (data[0] & 1) == 0;                       // 0x02 / 0x06 = on, 0x03 / 0x07 = off
+                }
+            }
+            catch { return true; }
+        }
+
+        /// Writes the StartupApproved value: 0x02 = enabled, 0x03 = disabled, then the time it was turned off (FILETIME).
+        public static string SetEnabled(StartupEntry e, bool on)
+        {
+            try
+            {
+                var data = new byte[12];
+                data[0] = on ? (byte)0x02 : (byte)0x03;
+                if (!on) Array.Copy(BitConverter.GetBytes(DateTime.UtcNow.ToFileTimeUtc()), 0, data, 4, 8);
+                using (var b = Base(e.Hive))
+                using (var k = b.CreateSubKey(e.ApprovedKey))
+                    k.SetValue(e.ValueName, data, RegistryValueKind.Binary);
+                e.Enabled = on;
+                return null;
+            }
+            catch (Exception ex) { return ex.Message; }
+        }
+    }
+
+    class StartupManagerForm : ToolDialog
+    {
+        private readonly DataGridView grid;
+        private readonly FlatButton toggleBtn, refreshBtn;
+        private readonly Label status, restartNote;
+        private readonly Action<string> log;
+        private bool loading;
+
+        public StartupManagerForm(Action<string> log)
+            : base("Startup Manager", "Programs that start with Windows. A program you turn off stays installed \u2014 it just doesn't start on its own.", Theme.Blue, 880, 560)
+        {
+            this.log = log;
+            int right = W - 2 - 24;
+            grid = AddGrid(new Rectangle(24, 92, right - 24, H - 2 - 92 - 82));
+            DarkGrid.Col(grid, "Name", "NAME", 150, false);
+            DarkGrid.Col(grid, "Command", "COMMAND OR TARGET", 330, false);
+            DarkGrid.Col(grid, "Location", "LOCATION", 160, false);
+            DarkGrid.Col(grid, "State", "STATE", 70, false);
+            grid.CellPainting += (s, e) =>
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex != 3) return;
+                bool on = Convert.ToString(e.Value) == "On";
+                DarkGrid.Pill(e, on ? "On" : "Off", on ? Theme.Green : Theme.Muted);
+            };
+            grid.SelectionChanged += (s, e) => UpdateButtons();
+            grid.CellDoubleClick += (s, e) => { if (e.RowIndex >= 0) ToggleSelected(); };
+
+            int by = H - 2 - 20 - 38;
+            status = AddText("Loading\u2026", new Rectangle(25, by, 400, 18), Theme.F(9f), Theme.Soft);
+            restartNote = AddText("Restart to apply. Changes take effect the next time you sign in.", new Rectangle(25, by + 20, 400, 18), Theme.F(8.5f), Theme.Faint);
+            AddButton("Close", null, Theme.Secondary, new Rectangle(right - 110, by, 110, 38), Close);
+            refreshBtn = AddButton("Refresh", "\uE72C", Theme.Secondary, new Rectangle(right - 110 - 10 - 120, by, 120, 38), Reload);
+            toggleBtn = AddButton("Disable", "\uE71A", Theme.Blue, new Rectangle(right - 110 - 10 - 120 - 10 - 140, by, 140, 38), ToggleSelected);
+            toggleBtn.Enabled = false;
+            Shown += (s, e) => Reload();
+        }
+
+        private void Reload()
+        {
+            if (loading) return;
+            loading = true;
+            status.Text = "Loading\u2026";
+            refreshBtn.Enabled = toggleBtn.Enabled = false;
+            var th = new Thread(() =>
+            {
+                List<StartupEntry> list;
+                try { list = StartupItems.Load(); }
+                catch { list = new List<StartupEntry>(); }
+                Post(() =>
+                {
+                    loading = false;
+                    refreshBtn.Enabled = true;
+                    grid.Rows.Clear();
+                    foreach (var en in list.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        int i = grid.Rows.Add(en.Name, en.Command, en.Location, en.Enabled ? "On" : "Off");
+                        grid.Rows[i].Tag = en;
+                    }
+                    grid.ClearSelection();
+                    UpdateStatus();
+                    UpdateButtons();
+                });
+            });
+            th.IsBackground = true;
+            th.SetApartmentState(ApartmentState.STA); // shortcut targets are read through COM
+            th.Start();
+        }
+
+        private void UpdateStatus()
+        {
+            var all = grid.Rows.Cast<DataGridViewRow>().Select(r => r.Tag as StartupEntry).Where(x => x != null).ToList();
+            int on = all.Count(x => x.Enabled);
+            status.Text = all.Count + " startup programs  \u00B7  " + on + " on, " + (all.Count - on) + " off";
+        }
+
+        private StartupEntry Selected()
+        {
+            if (grid.SelectedRows.Count == 0) return null;
+            return grid.SelectedRows[0].Tag as StartupEntry;
+        }
+
+        private void UpdateButtons()
+        {
+            if (toggleBtn == null) return;
+            var en = Selected();
+            bool enable = en != null && !en.Enabled;
+            toggleBtn.Enabled = en != null && !loading;
+            toggleBtn.Text = enable ? "Enable" : "Disable";
+            toggleBtn.Glyph = enable ? "\uE768" : "\uE71A";
+            toggleBtn.Invalidate();
+        }
+
+        private void ToggleSelected()
+        {
+            var en = Selected();
+            if (en == null || loading) return;
+            bool on = !en.Enabled;
+            string err = StartupItems.SetEnabled(en, on);
+            if (err != null)
+            {
+                ThemedDialog.Show(this, "Couldn't change it", "The startup setting for \"" + en.Name + "\" couldn't be changed.\n\n" + err, new[] { "OK" }, 0, Theme.Amber);
+                return;
+            }
+            var row = grid.SelectedRows[0];
+            row.Cells[3].Value = on ? "On" : "Off";
+            grid.InvalidateRow(row.Index);
+            restartNote.ForeColor = Theme.Amber;
+            restartNote.Text = "Restart to apply: \"" + en.Name + "\" will " + (on ? "start" : "no longer start") + " the next time you sign in.";
+            if (log != null) log("Startup Manager: " + en.Name + (on ? " enabled" : " disabled") + " (restart to apply)");
+            UpdateStatus();
+            UpdateButtons();
+        }
+    }
+
+    // ---------------- Scheduled Shutdown ----------------
+
+    class ScheduleShutdownForm : ToolDialog
+    {
+        private readonly Func<DateTime?> pending;
+        private readonly Action<DateTime, bool, bool> schedule;
+        private readonly Action cancelSchedule;
+        private readonly FlatButton modeMinutes, modeTime, startBtn, cancelBtn;
+        private readonly List<FlatButton> presets = new List<FlatButton>();
+        private readonly TextBox minutesBox, hourBox, minuteBox;
+        private readonly Panel minutesPanel, timePanel;
+        private readonly CheckToggle cleanFirst, stopFirst;
+        private readonly Label countdown, whenLabel;
+        private readonly System.Windows.Forms.Timer tick;
+        private bool atTime;
+
+        public static string Fmt(TimeSpan t)
+        {
+            if (t < TimeSpan.Zero) t = TimeSpan.Zero;
+            return ((int)t.TotalHours) + ":" + t.Minutes.ToString("00") + ":" + t.Seconds.ToString("00");
+        }
+
+        public ScheduleShutdownForm(Func<DateTime?> pending, Action<DateTime, bool, bool> schedule, Action cancelSchedule, bool clean, bool stopAll)
+            : base("Scheduled Shutdown", "Shut down the PC after a delay or at a set time.", Theme.Red, 600, 500)
+        {
+            this.pending = pending;
+            this.schedule = schedule;
+            this.cancelSchedule = cancelSchedule;
+            int right = W - 2 - 24;
+
+            AddCaption("WHEN", 25, 90, 200);
+            modeMinutes = AddButton("In minutes", "\uE916", Theme.Blue, new Rectangle(24, 110, 160, 36), () => SetMode(false));
+            modeTime = AddButton("At a time", "\uE823", Theme.Secondary, new Rectangle(24 + 160 + 8, 110, 160, 36), () => SetMode(true));
+
+            minutesPanel = new Panel { BackColor = Theme.Surface, Bounds = new Rectangle(24, 158, right - 24, 38) };
+            timePanel = new Panel { BackColor = Theme.Surface, Bounds = new Rectangle(24, 158, right - 24, 38), Visible = false };
+            Inner.Controls.Add(minutesPanel);
+            Inner.Controls.Add(timePanel);
+
+            int[] values = { 15, 30, 60, 120 };
+            for (int i = 0; i < values.Length; i++)
+            {
+                int v = values[i];
+                var b = new FlatButton { Text = v + " min", Bounds = new Rectangle(i * 78, 0, 70, 36), Font = Theme.Semi(9f), Tag = v };
+                b.SetColor(Theme.Secondary);
+                b.Click += (s, e) => { minutesBox.Text = v.ToString(); };
+                presets.Add(b);
+                minutesPanel.Controls.Add(b);
+            }
+            minutesBox = MakeInput(minutesPanel, new Rectangle(4 * 78 + 6, 0, 70, 36), "30");
+            minutesBox.MaxLength = 4;
+            minutesBox.KeyPress += DigitsOnly;
+            minutesBox.TextChanged += (s, e) => HighlightPreset();
+            minutesPanel.Controls.Add(new Label
+            {
+                Text = "minutes (1 \u2013 1440)", Font = Theme.F(9.5f), ForeColor = Theme.Muted, UseMnemonic = false,
+                Bounds = new Rectangle(4 * 78 + 6 + 70 + 10, 0, 160, 36), TextAlign = ContentAlignment.MiddleLeft
+            });
+
+            var soon = DateTime.Now.AddHours(1);
+            hourBox = MakeInput(timePanel, new Rectangle(0, 0, 56, 36), soon.Hour.ToString("00"));
+            timePanel.Controls.Add(new Label
+            {
+                Text = ":", Font = Theme.F(13f, FontStyle.Bold), ForeColor = Theme.Text, UseMnemonic = false,
+                Bounds = new Rectangle(58, 0, 16, 36), TextAlign = ContentAlignment.MiddleCenter
+            });
+            minuteBox = MakeInput(timePanel, new Rectangle(76, 0, 56, 36), "00");
+            foreach (var box in new[] { hourBox, minuteBox })
+            {
+                var bx = box;
+                bx.MaxLength = 2;
+                bx.KeyPress += DigitsOnly;
+                bx.KeyDown += (s, e) =>
+                {
+                    if (e.KeyCode != Keys.Up && e.KeyCode != Keys.Down) return;
+                    e.SuppressKeyPress = true;
+                    int max = bx == hourBox ? 24 : 60, n;
+                    int.TryParse(bx.Text, out n);
+                    n = (n + (e.KeyCode == Keys.Up ? 1 : max - 1)) % max;
+                    bx.Text = n.ToString("00");
+                };
+            }
+            timePanel.Controls.Add(new Label
+            {
+                Text = "24-hour time (use the arrow keys). A time that has already passed means tomorrow.",
+                Font = Theme.F(9f), ForeColor = Theme.Muted, UseMnemonic = false, AutoEllipsis = true,
+                Bounds = new Rectangle(146, 0, right - 24 - 146, 36), TextAlign = ContentAlignment.MiddleLeft
+            });
+
+            cleanFirst = new CheckToggle { Text = "Clean temporary files before shutting down", Bounds = new Rectangle(24, 210, right - 24, 30), Checked = clean };
+            stopFirst = new CheckToggle { Text = "Stop all apps first (apps on the keep list stay open)", Bounds = new Rectangle(24, 242, right - 24, 30), Checked = stopAll };
+            Inner.Controls.Add(cleanFirst);
+            Inner.Controls.Add(stopFirst);
+
+            AddCaption("STATUS", 25, 290, 200);
+            countdown = AddText("", new Rectangle(24, 308, right - 24, 34), Theme.F(16f, FontStyle.Bold), Theme.Muted);
+            whenLabel = AddText("", new Rectangle(25, 344, right - 25, 20), Theme.F(9.5f), Theme.Soft);
+            var note = AddText("The schedule is kept only while Vibe Stop Processing is running. It is not saved, so closing or restarting the app cancels it.",
+                new Rectangle(25, 374, right - 25, 38), Theme.F(8.5f), Theme.Faint);
+            note.AutoEllipsis = false;
+
+            int by = H - 2 - 20 - 38;
+            AddButton("Close", null, Theme.Secondary, new Rectangle(right - 110, by, 110, 38), Close);
+            cancelBtn = AddButton("Cancel scheduled shutdown", "\uE711", Theme.Secondary, new Rectangle(right - 110 - 10 - 230, by, 230, 38), () => { cancelSchedule(); UpdateState(); });
+            startBtn = AddButton("Schedule Shutdown", "\uE7E8", Theme.Red, new Rectangle(right - 110 - 10 - 230 - 10 - 180, by, 180, 38), Start);
+
+            HighlightPreset();
+            tick = new System.Windows.Forms.Timer { Interval = 500 };
+            tick.Tick += (s, e) => UpdateState();
+            tick.Start();
+            UpdateState();
+        }
+
+        private static void DigitsOnly(object sender, KeyPressEventArgs e)
+        {
+            if (!char.IsDigit(e.KeyChar) && !char.IsControl(e.KeyChar)) e.Handled = true;
+        }
+
+        private void SetMode(bool time)
+        {
+            atTime = time;
+            minutesPanel.Visible = !time;
+            timePanel.Visible = time;
+            modeMinutes.SetColor(time ? Theme.Secondary : Theme.Blue);
+            modeTime.SetColor(time ? Theme.Blue : Theme.Secondary);
+        }
+
+        private void HighlightPreset()
+        {
+            foreach (var b in presets)
+                b.SetColor(Convert.ToString(b.Tag) == minutesBox.Text.Trim() ? Theme.Blue : Theme.Secondary);
+        }
+
+        private void Start()
+        {
+            DateTime at;
+            if (!atTime)
+            {
+                int m;
+                if (!int.TryParse(minutesBox.Text.Trim(), out m) || m < 1 || m > 1440)
+                {
+                    ThemedDialog.Show(this, "Check the delay", "Enter a number of minutes between 1 and 1440.", new[] { "OK" }, 0, Theme.Amber);
+                    return;
+                }
+                at = DateTime.Now.AddMinutes(m);
+            }
+            else
+            {
+                int hh, mm;
+                if (!int.TryParse(hourBox.Text.Trim(), out hh) || hh < 0 || hh > 23 || !int.TryParse(minuteBox.Text.Trim(), out mm) || mm < 0 || mm > 59)
+                {
+                    ThemedDialog.Show(this, "Check the time", "Enter a time between 00:00 and 23:59.", new[] { "OK" }, 0, Theme.Amber);
+                    return;
+                }
+                at = DateTime.Today.AddHours(hh).AddMinutes(mm);
+                if (at <= DateTime.Now) at = at.AddDays(1);
+            }
+            schedule(at, cleanFirst.Checked, stopFirst.Checked);
+            UpdateState();
+        }
+
+        private void UpdateState()
+        {
+            var p = pending();
+            if (p == null)
+            {
+                countdown.Text = "No shutdown scheduled";
+                countdown.ForeColor = Theme.Muted;
+                whenLabel.Text = "Pick a delay or a time above, then click Schedule Shutdown.";
+                cancelBtn.Enabled = false;
+                if (startBtn.Text != "Schedule Shutdown") startBtn.Text = "Schedule Shutdown";
+                return;
+            }
+            countdown.Text = "Shutting down in " + Fmt(p.Value - DateTime.Now);
+            countdown.ForeColor = Theme.Red;
+            whenLabel.Text = "At " + p.Value.ToString("HH:mm") + (p.Value.Date > DateTime.Today ? " tomorrow" : " today") +
+                             ". You get a warning 60 seconds before, with an option to cancel.";
+            cancelBtn.Enabled = true;
+            if (startBtn.Text != "Reschedule") startBtn.Text = "Reschedule";
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            tick.Stop();
+            tick.Dispose();
+            base.OnFormClosed(e);
+        }
+    }
+
+    // ---------------- Big Files Finder ----------------
+
+    class BigFilesForm : ToolDialog
+    {
+        private readonly TextBox pathBox;
+        private readonly FlatButton browseBtn, scanBtn, filesTab, foldersTab, openBtn, deleteBtn;
+        private readonly DataGridView filesGrid, foldersGrid;
+        private readonly Label status;
+        private readonly Action<string> log;
+        private volatile bool cancel;
+        private bool scanning, deleting, showFolders;
+        private int scanId;
+
+        public BigFilesForm(Action<string> log)
+            : base("Big Files Finder", "Find the files and folders that take up the most space on a drive or in a folder.", Theme.Blue, 900, 620)
+        {
+            this.log = log;
+            int right = W - 2 - 24;
+            AddCaption("DRIVE OR FOLDER", 25, 90, 200);
+            pathBox = AddInput(new Rectangle(24, 110, right - 24 - 10 - 112 - 10 - 140, 38), Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+            browseBtn = AddButton("Browse", "\uE8B7", Theme.Secondary, new Rectangle(right - 140 - 10 - 112, 110, 112, 38), Browse);
+            scanBtn = AddButton("Scan", "\uE721", Theme.Blue, new Rectangle(right - 140, 110, 140, 38), ScanOrCancel);
+            pathBox.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; if (!scanning) StartScan(); } };
+            status = AddText("Type a drive (like D:\\) or a folder, or click Browse. Then click Scan. Linked folders (junctions) are skipped.",
+                new Rectangle(25, 158, right - 25, 20), Theme.F(9.5f), Theme.Soft);
+
+            filesTab = AddButton("Largest files", "\uE8A5", Theme.Blue, new Rectangle(24, 188, 160, 34), () => ShowTab(false));
+            foldersTab = AddButton("Largest folders", "\uE8B7", Theme.Secondary, new Rectangle(24 + 160 + 8, 188, 170, 34), () => ShowTab(true));
+
+            var gridRect = new Rectangle(24, 232, right - 24, H - 2 - 232 - 80);
+            filesGrid = AddGrid(gridRect);
+            foldersGrid = AddGrid(gridRect);
+            foreach (var g in new[] { filesGrid, foldersGrid })
+            {
+                DarkGrid.Col(g, "Size", "SIZE", 90, true);
+                DarkGrid.Col(g, "Path", g == filesGrid ? "FILE (TOP 50)" : "FOLDER (TOP 20, TOTAL SIZE)", 520, false);
+                g.SelectionChanged += (s, e) => UpdateButtons();
+                g.CellDoubleClick += (s, e) => { if (e.RowIndex >= 0) OpenSelected(); };
+            }
+            foldersGrid.Parent.Visible = false;
+
+            int by = H - 2 - 20 - 38;
+            AddButton("Close", null, Theme.Secondary, new Rectangle(right - 110, by, 110, 38), Close);
+            deleteBtn = AddButton("Delete", "\uE74D", Theme.Red, new Rectangle(right - 110 - 10 - 130, by, 130, 38), DeleteSelected);
+            openBtn = AddButton("Open folder", "\uE838", Theme.Secondary, new Rectangle(right - 110 - 10 - 130 - 10 - 150, by, 150, 38), OpenSelected);
+            AddText("Delete moves the item to the Recycle Bin.", new Rectangle(25, by + 10, 330, 18), Theme.F(8.5f), Theme.Faint);
+            UpdateButtons();
+        }
+
+        protected override bool CanClose() { return !deleting; }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            if (!e.Cancel) cancel = true;
+        }
+
+        private DataGridView Current { get { return showFolders ? foldersGrid : filesGrid; } }
+
+        private void ShowTab(bool folders)
+        {
+            showFolders = folders;
+            filesGrid.Parent.Visible = !folders;
+            foldersGrid.Parent.Visible = folders;
+            filesTab.SetColor(folders ? Theme.Secondary : Theme.Blue);
+            foldersTab.SetColor(folders ? Theme.Blue : Theme.Secondary);
+            UpdateButtons();
+        }
+
+        private string SelectedPath()
+        {
+            var g = Current;
+            if (g == null || g.SelectedRows.Count == 0) return null;
+            return g.SelectedRows[0].Tag as string;
+        }
+
+        private void UpdateButtons()
+        {
+            if (openBtn == null || deleteBtn == null) return;
+            bool has = SelectedPath() != null;
+            openBtn.Enabled = has;
+            deleteBtn.Enabled = has && !deleting && !scanning;
+        }
+
+        private void Browse()
+        {
+            using (var dlg = new FolderBrowserDialog { Description = "Choose a drive or folder to scan", ShowNewFolderButton = false })
+            {
+                string cur = pathBox.Text.Trim().Trim('"');
+                if (Directory.Exists(cur)) dlg.SelectedPath = cur;
+                if (dlg.ShowDialog(this) == DialogResult.OK) pathBox.Text = dlg.SelectedPath;
+            }
+        }
+
+        private void ScanOrCancel()
+        {
+            if (scanning)
+            {
+                cancel = true;
+                scanBtn.Text = "Cancelling\u2026";
+                scanBtn.Enabled = false;
+            }
+            else StartScan();
+        }
+
+        private void StartScan()
+        {
+            string raw = pathBox.Text.Trim().Trim('"').Trim();
+            if (raw.Length == 2 && raw[1] == ':') raw += "\\";
+            string root = null;
+            try { if (raw.Length > 0) root = Path.GetFullPath(raw); } catch { }
+            if (root == null || !Directory.Exists(root))
+            {
+                status.ForeColor = Theme.Amber;
+                status.Text = "That drive or folder wasn't found.";
+                return;
+            }
+            scanning = true;
+            cancel = false;
+            int id = ++scanId;
+            scanBtn.Text = "Cancel scan";
+            scanBtn.Glyph = "\uE711";
+            scanBtn.SetColor(Theme.Secondary);
+            browseBtn.Enabled = false;
+            pathBox.ReadOnly = true;
+            filesGrid.Rows.Clear();
+            foldersGrid.Rows.Clear();
+            status.ForeColor = Theme.Soft;
+            status.Text = "Scanning\u2026";
+            UpdateButtons();
+            var th = new Thread(() => Scan(root, id));
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private static void AddTop(List<KeyValuePair<long, string>> top, long len, string path)
+        {
+            if (top.Count >= 50 && len <= top[top.Count - 1].Key) return;
+            int i = 0;
+            while (i < top.Count && top[i].Key >= len) i++;
+            top.Insert(i, new KeyValuePair<long, string>(len, path));
+            if (top.Count > 50) top.RemoveAt(50);
+        }
+
+        private void Scan(string root, int id)
+        {
+            // every folder gets an index; a folder always comes after its parent,
+            // so the totals can be added up from the end in one pass
+            var paths = new List<string> { root };
+            var parent = new List<int> { -1 };
+            var own = new List<long> { 0 };
+            var stack = new Stack<int>();
+            stack.Push(0);
+            var top = new List<KeyValuePair<long, string>>();
+            long files = 0, total = 0;
+            int lastTick = Environment.TickCount;
+            while (stack.Count > 0 && !cancel)
+            {
+                int di = stack.Pop();
+                try
+                {
+                    foreach (var e in new DirectoryInfo(paths[di]).EnumerateFileSystemInfos())
+                    {
+                        if (cancel) break;
+                        FileAttributes a;
+                        try { a = e.Attributes; } catch { continue; }
+                        if ((a & FileAttributes.ReparsePoint) != 0) continue; // never follow junctions or links
+                        if ((a & FileAttributes.Directory) != 0)
+                        {
+                            paths.Add(e.FullName);
+                            parent.Add(di);
+                            own.Add(0);
+                            stack.Push(paths.Count - 1);
+                            continue;
+                        }
+                        long len;
+                        try { len = ((FileInfo)e).Length; } catch { continue; }
+                        own[di] += len;
+                        files++;
+                        total += len;
+                        AddTop(top, len, e.FullName);
+                    }
+                }
+                catch { }
+                if (Environment.TickCount - lastTick > 400)
+                {
+                    lastTick = Environment.TickCount;
+                    long f = files, t = total;
+                    string cur = paths[di];
+                    Post(() => { if (id == scanId) status.Text = "Scanning\u2026  " + f.ToString("N0") + " files, " + Theme.FormatBytes(t) + "  \u00B7  " + cur; });
+                }
+            }
+            bool wasCancelled = cancel;
+            var totals = own.ToArray();
+            for (int i = paths.Count - 1; i > 0; i--) totals[parent[i]] += totals[i];
+            var topDirs = Enumerable.Range(1, Math.Max(0, paths.Count - 1))
+                .OrderByDescending(i => totals[i]).Take(20)
+                .Select(i => new KeyValuePair<long, string>(totals[i], paths[i])).ToList();
+            long fc = files, tt = total;
+            Post(() =>
+            {
+                if (id != scanId || IsDisposed) return;
+                scanning = false;
+                scanBtn.Text = "Scan";
+                scanBtn.Glyph = "\uE721";
+                scanBtn.SetColor(Theme.Blue);
+                scanBtn.Enabled = true;
+                browseBtn.Enabled = true;
+                pathBox.ReadOnly = false;
+                foreach (var kv in top)
+                {
+                    int r = filesGrid.Rows.Add(Theme.FormatBytes(kv.Key), kv.Value);
+                    filesGrid.Rows[r].Tag = kv.Value;
+                }
+                foreach (var kv in topDirs)
+                {
+                    int r = foldersGrid.Rows.Add(Theme.FormatBytes(kv.Key), kv.Value);
+                    foldersGrid.Rows[r].Tag = kv.Value;
+                }
+                filesGrid.ClearSelection();
+                foldersGrid.ClearSelection();
+                status.ForeColor = wasCancelled ? Theme.Amber : Theme.Soft;
+                status.Text = (wasCancelled ? "Scan cancelled \u2014 partial results: " : "Done: ") + fc.ToString("N0") + " files, " + Theme.FormatBytes(tt) + " in " + root;
+                if (log != null && !wasCancelled) log("Big Files Finder: scanned " + root + " (" + Theme.FormatBytes(tt) + ")");
+                UpdateButtons();
+            });
+        }
+
+        private void OpenSelected()
+        {
+            string p = SelectedPath();
+            if (p == null) return;
+            try { Process.Start("explorer.exe", "/select,\"" + p + "\""); } catch { }
+        }
+
+        private void DeleteSelected()
+        {
+            string p = SelectedPath();
+            if (p == null || deleting || scanning) return;
+            var g = Current;
+            string sizeText = Convert.ToString(g.SelectedRows[0].Cells[0].Value);
+            bool isDir = Directory.Exists(p);
+            if (!isDir && !File.Exists(p))
+            {
+                status.ForeColor = Theme.Soft;
+                status.Text = "It's already gone: " + p;
+                RemoveRows(p, false);
+                return;
+            }
+            string blocked = PermanentDeleteForm.SafetyCheck(p);
+            if (blocked != null)
+            {
+                ThemedDialog.Show(this, "Blocked for safety", p + "\n\n" + blocked, new[] { "OK" }, 0, Theme.Amber);
+                return;
+            }
+            int a = ThemedDialog.Show(this, "Move to the Recycle Bin?",
+                "This " + (isDir ? "folder and everything in it" : "file") + " will be moved to the Recycle Bin:\n\n" + p + "\n\n" + sizeText +
+                "\n\nYou can restore it from the Recycle Bin later.",
+                new[] { "Move to Recycle Bin", "Cancel" }, 0, Theme.Red, 1);
+            if (a != 0) return;
+
+            deleting = true;
+            UpdateButtons();
+            status.ForeColor = Theme.Soft;
+            status.Text = "Moving to the Recycle Bin\u2026";
+            var th = new Thread(() =>
+            {
+                string err = RecycleBin.Send(p);
+                Post(() =>
+                {
+                    deleting = false;
+                    if (err == null)
+                    {
+                        RemoveRows(p, isDir);
+                        status.ForeColor = Theme.Green;
+                        status.Text = "Moved to the Recycle Bin: " + p;
+                        if (log != null) log("Big Files Finder: moved to the Recycle Bin: " + p);
+                    }
+                    else
+                    {
+                        status.ForeColor = Theme.Amber;
+                        status.Text = "Couldn't move it: " + err;
+                    }
+                    UpdateButtons();
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void RemoveRows(string p, bool isDir)
+        {
+            foreach (var g in new[] { filesGrid, foldersGrid })
+                for (int i = g.Rows.Count - 1; i >= 0; i--)
+                {
+                    string t = g.Rows[i].Tag as string;
+                    if (t == null) continue;
+                    if (t.Equals(p, StringComparison.OrdinalIgnoreCase) || (isDir && t.StartsWith(p.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)))
+                        g.Rows.RemoveAt(i);
+                }
+        }
+    }
+
+    // ---------------- Uninstall Leftovers ----------------
+
+    class LeftoversForm : ToolDialog
+    {
+        private class Item
+        {
+            public string Name, Path;
+            public long Size;
+            public DateTime Modified;
+            public bool Checked;
+        }
+
+        private readonly DataGridView grid;
+        private readonly FlatButton scanBtn, deleteBtn;
+        private readonly Label status;
+        private readonly Action<string> log;
+        private bool busy;
+
+        private static readonly string[] SkipPrefix = { "Microsoft", "Windows", "NVIDIA", "Intel", "AMD", "Realtek", "IIS" };
+
+        // conservative: shared, runtime and Windows folders that never have their own uninstall entry
+        private static readonly string[] SkipExact =
+        {
+            "Common Files", "WindowsApps", "Package Cache", "Packages", "Temp", "dotnet", ".dotnet", "Reference Assemblies",
+            "MSBuild", "ModifiableWindowsApps", "Internet Explorer", "Programs", "VirtualStore", "ConnectedDevicesPlatform",
+            "D3DSCache", "CrashDumps", "Comms", "Publishers", "PlaceholderTileLogoFolder", "Diagnostics", "IsolatedStorage",
+            "History", "assembly", "PeerDistRepub", "SoftwareDistribution", "USOPrivate", "USOShared", "ssh", "Desktop",
+            "Documents", "Start Menu", "Templates", "Application Data", "Favorites", "Adobe", "Oracle", "Java", "Sun",
+            "npm", "npm-cache", "pnpm", "Yarn", "nvm", "pip", "Python", "NuGet", "uv", "Package Management",
+            "regid.1991-06.com.microsoft", "StopProcessing", "Vibe", "Downloaded Installations", "Uninstall Information",
+            // tool and build caches: they belong to tools that are still installed
+            "go", "go-build", "electron", "electron-builder", "node-gyp", "ms-playwright", "Cypress", "gradle", "pypa",
+            "chocolatey", "ChocolateyHttpCache", "Cache", "Caches", "CrashReports", "pnpm-cache", "deno", "bun", "cargo", "rustup"
+        };
+
+        // a folder changed within this many days is still in use, so it is never a leftover
+        private const int RecentDays = 30;
+
+        /// Start Menu shortcut names: every app the user can start, including ones
+        /// that have no uninstall entry (per-user and store-style installs).
+        private static void ReadStartMenu(HashSet<string> tokens)
+        {
+            foreach (var root in new[] { Environment.GetFolderPath(Environment.SpecialFolder.Programs), Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms) })
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                var stack = new Stack<string>();
+                stack.Push(root);
+                int seen = 0;
+                while (stack.Count > 0 && seen < 5000)
+                {
+                    string d = stack.Pop();
+                    try
+                    {
+                        foreach (var f in Directory.GetFiles(d, "*.lnk")) { seen++; AddToken(tokens, Path.GetFileNameWithoutExtension(f)); }
+                        foreach (var s in Directory.GetDirectories(d)) { seen++; AddToken(tokens, Path.GetFileName(s)); stack.Push(s); }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        /// True when the folder is (or holds) a folder on the PATH: a command-line tool that is still installed.
+        internal static bool OnPath(string dir)
+        {
+            string fp = dir.TrimEnd('\\') + "\\";
+            string path = (Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine) ?? "") + ";" +
+                          (Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "");
+            foreach (var raw in path.Split(';'))
+            {
+                string p = raw.Trim().Trim('"');
+                if (p.Length == 0) continue;
+                try { p = Environment.ExpandEnvironmentVariables(p).TrimEnd('\\') + "\\"; } catch { continue; }
+                if (p.StartsWith(fp, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        internal static int CommonPrefix(string a, string b)
+        {
+            int i = 0;
+            while (i < a.Length && i < b.Length && a[i] == b[i]) i++;
+            return i;
+        }
+
+        public LeftoversForm(Action<string> log)
+            : base("Uninstall Leftovers", "Folders left behind by programs that are no longer installed.", Theme.Blue, 920, 620)
+        {
+            this.log = log;
+            int right = W - 2 - 24;
+
+            var warn = new Panel { BackColor = Theme.Mix(Theme.Surface, Theme.Amber, 0.14), Bounds = new Rectangle(24, 88, right - 24, 44) };
+            warn.Controls.Add(new Label { Text = "\uE7BA", Font = Theme.Icon(13f), ForeColor = Theme.Amber, Bounds = new Rectangle(12, 0, 26, 44), TextAlign = ContentAlignment.MiddleLeft });
+            warn.Controls.Add(new Label
+            {
+                Text = "Check each folder before deleting. A folder can still be used by a program that has no uninstall entry.",
+                Font = Theme.Semi(9.5f), ForeColor = Theme.Lighten(Theme.Amber, 0.2), Bounds = new Rectangle(42, 0, right - 24 - 54, 44),
+                TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false, AutoEllipsis = true
+            });
+            Inner.Controls.Add(warn);
+
+            grid = AddGrid(new Rectangle(24, 144, right - 24, H - 2 - 144 - 80));
+            var pick = DarkGrid.Col(grid, "Pick", "", 10, false);
+            pick.AutoSizeMode = DataGridViewAutoSizeColumnMode.None;
+            pick.Width = 44;
+            DarkGrid.Col(grid, "Name", "FOLDER", 150, false);
+            DarkGrid.Col(grid, "Path", "PATH", 330, false);
+            DarkGrid.Col(grid, "Size", "SIZE", 80, true);
+            DarkGrid.Col(grid, "Modified", "LAST MODIFIED", 110, false);
+            grid.CellPainting += (s, e) =>
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex != 0) return;
+                var it = grid.Rows[e.RowIndex].Tag as Item;
+                DarkGrid.Box(e, it != null && it.Checked);
+            };
+            grid.CellClick += (s, e) => { if (e.RowIndex >= 0 && e.ColumnIndex == 0) Toggle(e.RowIndex); };
+            grid.CellDoubleClick += (s, e) => { if (e.RowIndex >= 0 && e.ColumnIndex > 0) Toggle(e.RowIndex); };
+            grid.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Space && grid.SelectedRows.Count > 0) { e.SuppressKeyPress = true; Toggle(grid.SelectedRows[0].Index); }
+            };
+
+            int by = H - 2 - 20 - 38;
+            status = AddText("Looking for leftover folders\u2026", new Rectangle(25, by + 10, 340, 18), Theme.F(9f), Theme.Soft);
+            AddButton("Close", null, Theme.Secondary, new Rectangle(right - 110, by, 110, 38), Close);
+            deleteBtn = AddButton("Delete selected", "\uE74D", Theme.Red, new Rectangle(right - 110 - 10 - 170, by, 170, 38), DeleteSelected);
+            scanBtn = AddButton("Scan Again", "\uE721", Theme.Secondary, new Rectangle(right - 110 - 10 - 170 - 10 - 130, by, 130, 38), StartScan);
+            deleteBtn.Enabled = false;
+            Shown += (s, e) => StartScan();
+        }
+
+        protected override bool CanClose() { return !busy; }
+
+        private void Toggle(int rowIndex)
+        {
+            if (busy) return;
+            var it = grid.Rows[rowIndex].Tag as Item;
+            if (it == null) return;
+            it.Checked = !it.Checked;
+            grid.InvalidateCell(0, rowIndex);
+            UpdateButtons();
+        }
+
+        private List<Item> Picked()
+        {
+            return grid.Rows.Cast<DataGridViewRow>().Select(r => r.Tag as Item).Where(i => i != null && i.Checked).ToList();
+        }
+
+        private void UpdateButtons()
+        {
+            int n = Picked().Count;
+            deleteBtn.Enabled = !busy && n > 0;
+            deleteBtn.Text = n > 0 ? "Delete selected (" + n + ")" : "Delete selected";
+            scanBtn.Enabled = !busy;
+        }
+
+        private void StartScan()
+        {
+            if (busy) return;
+            busy = true;
+            grid.Rows.Clear();
+            status.ForeColor = Theme.Soft;
+            status.Text = "Looking for leftover folders\u2026";
+            UpdateButtons();
+            var th = new Thread(() =>
+            {
+                List<Item> found;
+                try { found = Find(line => Post(() => status.Text = line)); }
+                catch { found = new List<Item>(); }
+                Post(() =>
+                {
+                    busy = false;
+                    foreach (var it in found.OrderByDescending(x => x.Size))
+                    {
+                        int r = grid.Rows.Add("", it.Name, it.Path, Theme.FormatBytes(it.Size),
+                            it.Modified == DateTime.MinValue ? "\u2014" : it.Modified.ToString("d MMM yyyy"));
+                        grid.Rows[r].Tag = it;
+                    }
+                    grid.ClearSelection();
+                    status.Text = found.Count == 0 ? "No leftover folders found." :
+                        found.Count + " possible leftovers  \u00B7  " + Theme.FormatBytes(found.Sum(x => x.Size));
+                    UpdateButtons();
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        // ---- finding leftovers
+
+        internal static string Norm(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in s.ToLowerInvariant())
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) sb.Append(c);
+            return sb.ToString();
+        }
+
+        /// The exe path at the start of a command line or DisplayIcon value, or null.
+        internal static string PathOf(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return null;
+            string s;
+            try { s = Environment.ExpandEnvironmentVariables(cmd.Trim()); } catch { return null; }
+            if (s.StartsWith("\""))
+            {
+                int q = s.IndexOf('"', 1);
+                s = q > 1 ? s.Substring(1, q - 1) : s.Trim('"');
+            }
+            else
+            {
+                int i = s.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+                if (i > 0) s = s.Substring(0, i + 4);
+                else
+                {
+                    int c = s.IndexOf(',');
+                    if (c > 0) s = s.Substring(0, c);
+                }
+            }
+            s = s.Trim();
+            if (s.StartsWith(@"\??\")) s = s.Substring(4);
+            return s.Length > 3 && s[1] == ':' ? s : null;
+        }
+
+        private static void AddToken(HashSet<string> tokens, object value)
+        {
+            string n = Norm(Convert.ToString(value));
+            if (n.Length >= 2) tokens.Add(n);
+        }
+
+        internal static void ReadInstalled(HashSet<string> tokens, List<string> regPaths)
+        {
+            foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
+                foreach (var sub in new[] { @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" })
+                {
+                    try
+                    {
+                        using (var b = RegistryKey.OpenBaseKey(hive, Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default))
+                        using (var k = b.OpenSubKey(sub))
+                        {
+                            if (k == null) continue;
+                            foreach (var name in k.GetSubKeyNames())
+                            {
+                                try
+                                {
+                                    using (var e = k.OpenSubKey(name))
+                                    {
+                                        if (e == null) continue;
+                                        if (!name.StartsWith("{")) AddToken(tokens, name);
+                                        AddToken(tokens, e.GetValue("DisplayName"));
+                                        AddToken(tokens, e.GetValue("Publisher"));
+                                        string loc = Convert.ToString(e.GetValue("InstallLocation"));
+                                        if (!string.IsNullOrWhiteSpace(loc))
+                                        {
+                                            loc = Environment.ExpandEnvironmentVariables(loc.Trim().Trim('"')).TrimEnd('\\');
+                                            if (loc.Length > 3)
+                                            {
+                                                regPaths.Add(loc);
+                                                try { AddToken(tokens, Path.GetFileName(loc)); } catch { }
+                                            }
+                                        }
+                                        string icon = PathOf(Convert.ToString(e.GetValue("DisplayIcon")));
+                                        if (icon != null) regPaths.Add(icon);
+                                        string un = PathOf(Convert.ToString(e.GetValue("UninstallString")));
+                                        if (un != null) regPaths.Add(un);
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+            // programs that run as a service or at sign-in are in use, even without an uninstall entry
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services"))
+                    if (k != null)
+                        foreach (var name in k.GetSubKeyNames())
+                        {
+                            try
+                            {
+                                using (var e = k.OpenSubKey(name))
+                                {
+                                    string p = e == null ? null : PathOf(Convert.ToString(e.GetValue("ImagePath")));
+                                    if (p != null) regPaths.Add(p);
+                                }
+                            }
+                            catch { }
+                        }
+            }
+            catch { }
+            foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
+                foreach (var sub in new[] { @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run" })
+                {
+                    try
+                    {
+                        using (var b = RegistryKey.OpenBaseKey(hive, Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default))
+                        using (var k = b.OpenSubKey(sub))
+                        {
+                            if (k == null) continue;
+                            foreach (var v in k.GetValueNames())
+                            {
+                                string p = PathOf(Convert.ToString(k.GetValue(v)));
+                                if (p != null) regPaths.Add(p);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+        }
+
+        internal static List<string> RunningPaths()
+        {
+            var list = new List<string>();
+            foreach (var p in Process.GetProcesses())
+            {
+                try
+                {
+                    string path = MainForm.ExePath(p.Id);
+                    if (!string.IsNullOrEmpty(path)) list.Add(path);
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+            return list;
+        }
+
+        internal static bool Skip(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.StartsWith(".") || name.StartsWith("{")) return true;
+            foreach (var p in SkipPrefix) if (name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return true;
+            foreach (var x in SkipExact) if (name.Equals(x, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static bool LooksInstalled(string name, string dir, HashSet<string> tokens, List<string> regPaths)
+        {
+            string n = Norm(name);
+            if (n.Length < 2) return true; // can't tell: keep it
+            foreach (var t in tokens)
+            {
+                if (t == n) return true;
+                if (n.Length >= 4 && t.Contains(n)) return true;
+                if (t.Length >= 4 && n.Contains(t)) return true;
+                if (CommonPrefix(t, n) >= 6) return true; // "PotPlayerMini64" vs "PotPlayer 64 bit"
+            }
+            string fp = dir.TrimEnd('\\') + "\\";
+            foreach (var p in regPaths)
+                if (p.StartsWith(fp, StringComparison.OrdinalIgnoreCase) || (p.TrimEnd('\\') + "\\").Equals(fp, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        internal static bool HasRunning(string dir, List<string> running)
+        {
+            string fp = dir.TrimEnd('\\') + "\\";
+            return running.Any(p => p.StartsWith(fp, StringComparison.OrdinalIgnoreCase));
+        }
+
+        internal static void Measure(string dir, out long size, out DateTime modified)
+        {
+            size = 0;
+            modified = DateTime.MinValue;
+            try { modified = Directory.GetLastWriteTime(dir); } catch { }
+            var stack = new Stack<string>();
+            stack.Push(dir);
+            int seen = 0;
+            while (stack.Count > 0 && seen < 200000)
+            {
+                string d = stack.Pop();
+                try
+                {
+                    foreach (var e in new DirectoryInfo(d).EnumerateFileSystemInfos())
+                    {
+                        seen++;
+                        FileAttributes a = e.Attributes;
+                        if ((a & FileAttributes.ReparsePoint) != 0) continue;
+                        if (e.LastWriteTime > modified) modified = e.LastWriteTime;
+                        if ((a & FileAttributes.Directory) != 0) stack.Push(e.FullName);
+                        else size += ((FileInfo)e).Length;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static List<Item> Find(Action<string> progress)
+        {
+            var tokens = new HashSet<string>();
+            var regPaths = new List<string>();
+            progress("Reading the list of installed programs\u2026");
+            ReadInstalled(tokens, regPaths);
+            ReadStartMenu(tokens);
+            var running = RunningPaths();
+            DateTime recent = DateTime.Now.AddDays(-RecentDays);
+
+            string appDir = "", dataDir = "";
+            try { appDir = Path.GetDirectoryName(Application.ExecutablePath).TrimEnd('\\'); } catch { }
+            try { dataDir = AppInfo.DataDir.TrimEnd('\\'); } catch { }
+
+            var roots = new List<string>();
+            foreach (var r in new[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+            })
+                if (!string.IsNullOrEmpty(r) && !roots.Any(x => x.Equals(r, StringComparison.OrdinalIgnoreCase))) roots.Add(r);
+
+            var found = new List<Item>();
+            foreach (var root in roots)
+            {
+                string[] dirs;
+                try { dirs = Directory.GetDirectories(root); } catch { continue; }
+                foreach (var dir in dirs)
+                {
+                    try
+                    {
+                        string name = Path.GetFileName(dir);
+                        FileAttributes a = File.GetAttributes(dir);
+                        if ((a & FileAttributes.ReparsePoint) != 0) continue;
+                        if ((a & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
+                        if (Skip(name)) continue;
+                        string d = dir.TrimEnd('\\');
+                        if (d.Equals(appDir, StringComparison.OrdinalIgnoreCase) || d.Equals(dataDir, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (appDir.StartsWith(d + "\\", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (PermanentDeleteForm.SafetyCheck(d) != null) continue;
+                        if (LooksInstalled(name, d, tokens, regPaths)) continue;
+                        if (HasRunning(d, running)) continue;
+                        if (OnPath(d)) continue;
+                        progress("Checking " + d + "\u2026");
+                        long size;
+                        DateTime mod;
+                        Measure(d, out size, out mod);
+                        if (mod > recent) continue; // used in the last 30 days: still in use
+                        found.Add(new Item { Name = name, Path = d, Size = size, Modified = mod });
+                    }
+                    catch { }
+                }
+            }
+            return found;
+        }
+
+        // ---- deleting (to the Recycle Bin)
+
+        private void DeleteSelected()
+        {
+            var picked = Picked();
+            if (busy || picked.Count == 0) return;
+            var lines = picked.Take(10).Select(i => "\u2022  " + i.Path + "  (" + Theme.FormatBytes(i.Size) + ")").ToArray();
+            string more = picked.Count > 10 ? "\n\u2026and " + (picked.Count - 10) + " more" : "";
+            int a = ThemedDialog.Show(this, "Move " + picked.Count + (picked.Count == 1 ? " folder" : " folders") + " to the Recycle Bin?",
+                "These folders will be moved to the Recycle Bin:\n\n" + string.Join("\n", lines) + more +
+                "\n\nTotal " + Theme.FormatBytes(picked.Sum(x => x.Size)) + ". Check each folder before deleting. You can restore them from the Recycle Bin.",
+                new[] { "Move to Recycle Bin", "Cancel" }, 0, Theme.Red, 1);
+            if (a != 0) return;
+
+            busy = true;
+            UpdateButtons();
+            var th = new Thread(() =>
+            {
+                var running = RunningPaths();
+                var moved = new List<Item>();
+                var failed = new List<string>();
+                int n = 0;
+                foreach (var it in picked)
+                {
+                    n++;
+                    int k = n;
+                    Post(() => status.Text = "Moving " + k + " of " + picked.Count + " to the Recycle Bin\u2026");
+                    string why = null;
+                    try
+                    {
+                        if (!Directory.Exists(it.Path)) { moved.Add(it); continue; }
+                        if ((File.GetAttributes(it.Path) & FileAttributes.ReparsePoint) != 0) why = "it is a link";
+                        else why = PermanentDeleteForm.SafetyCheck(it.Path);
+                        if (why == null && HasRunning(it.Path, running)) why = "a program inside it is running";
+                        if (why == null) why = RecycleBin.Send(it.Path);
+                    }
+                    catch (Exception ex) { why = ex.Message; }
+                    if (why == null) moved.Add(it);
+                    else failed.Add(it.Name + ": " + why);
+                }
+                Post(() =>
+                {
+                    busy = false;
+                    for (int i = grid.Rows.Count - 1; i >= 0; i--)
+                        if (moved.Contains(grid.Rows[i].Tag as Item)) grid.Rows.RemoveAt(i);
+                    status.ForeColor = failed.Count == 0 ? Theme.Green : Theme.Amber;
+                    status.Text = "Moved " + moved.Count + " to the Recycle Bin" + (failed.Count > 0 ? ", " + failed.Count + " not moved." : ".");
+                    if (log != null)
+                    {
+                        foreach (var m in moved) log("Uninstall Leftovers: moved to the Recycle Bin: " + m.Path);
+                        foreach (var f in failed) log("Uninstall Leftovers: not moved: " + f);
+                    }
+                    UpdateButtons();
+                    if (failed.Count > 0)
+                        ThemedDialog.Show(this, "Some folders were not moved", string.Join("\n", failed.Take(8).ToArray()) +
+                            (failed.Count > 8 ? "\n\u2026and " + (failed.Count - 8) + " more" : ""), new[] { "OK" }, 0, Theme.Amber);
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+    }
+
+    // ---------------- App Uninstaller ----------------
+
+    class InstalledApp
+    {
+        public string Name = "", Publisher = "", Version = "", Source = "", KeyName = "", KeyPath = "";
+        public string UninstallString = "", InstallLocation = "", DisplayIcon = "";
+        public RegistryHive Hive;
+        public long SizeKb;
+        public DateTime Installed = DateTime.MinValue;
+        public bool Broken;
+    }
+
+    /// Lists the installed programs, runs a program's own uninstaller, then finds
+    /// the folders and registry keys it left behind. Folders go to the Recycle Bin
+    /// and every registry key is exported to a .reg file before it is removed.
+    class AppUninstallerForm : ToolDialog
+    {
+        private class Leftover
+        {
+            public bool IsKey, IsEntry, Checked;
+            public string Path = "", SubPath = "", Reason = "", Backup;
+            public RegistryHive Hive;
+            public long Size;
+        }
+
+        private const StringComparison IC = StringComparison.OrdinalIgnoreCase;
+        private const string UninstallKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        private const string UninstallKey32 = @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+        private const string SelfId = "8F3C2A71-5B4E-4D2A-9C61-7E2B5A9D4F10";
+
+        // keys directly under Software that belong to Windows or are shared by many programs
+        private static readonly string[] SharedKeys =
+        {
+            "Microsoft", "Classes", "Policies", "WOW6432Node", "Clients", "RegisteredApplications", "ODBC", "Khronos",
+            "Partner", "OEM", "DefaultUserEnvironment", "Description", "Setup"
+        };
+
+        private readonly DataGridView appGrid, leftGrid;
+        private readonly TextBox searchBox;
+        private readonly FlatButton refreshBtn, uninstallBtn, onlyBtn, backBtn, removeBtn;
+        private readonly Label status, searchCaption, stepCaption, stepText;
+        private readonly Action<string> log;
+        private List<InstalledApp> apps = new List<InstalledApp>();
+        private InstalledApp current;
+        private bool busy, waiting, leftStep;
+        private volatile bool stopWait;
+        private int sortCol;
+        private bool sortAsc = true;
+
+        public AppUninstallerForm(Action<string> log)
+            : base("App Uninstaller", "Remove programs together with the files and settings they leave behind.", Theme.Blue, 960, 640)
+        {
+            this.log = log;
+            int right = W - 2 - 24;
+
+            searchCaption = AddCaption("SEARCH", 25, 90, 200);
+            searchBox = AddInput(new Rectangle(24, 110, right - 24 - 10 - 120, 38), "");
+            searchBox.TextChanged += (s, e) => Populate();
+            refreshBtn = AddButton("Refresh", "\uE72C", Theme.Secondary, new Rectangle(right - 120, 110, 120, 38), Reload);
+
+            stepCaption = AddCaption("", 25, 90, right - 25);
+            stepText = AddText("", new Rectangle(25, 110, right - 25, 40), Theme.F(9.5f), Theme.Soft);
+            stepCaption.Visible = false;
+            stepText.Visible = false;
+
+            var gridRect = new Rectangle(24, 160, right - 24, H - 2 - 160 - 80);
+            appGrid = AddGrid(gridRect);
+            DarkGrid.Col(appGrid, "Name", "NAME", 230, false);
+            DarkGrid.Col(appGrid, "Publisher", "PUBLISHER", 160, false);
+            DarkGrid.Col(appGrid, "Version", "VERSION", 90, false);
+            DarkGrid.Col(appGrid, "Size", "SIZE", 75, true);
+            DarkGrid.Col(appGrid, "Installed", "INSTALLED", 90, false);
+            DarkGrid.Col(appGrid, "Source", "SOURCE", 130, false);
+            foreach (DataGridViewColumn c in appGrid.Columns) c.SortMode = DataGridViewColumnSortMode.Programmatic;
+            appGrid.ColumnHeaderMouseClick += (s, e) =>
+            {
+                if (e.ColumnIndex == sortCol) sortAsc = !sortAsc;
+                else { sortCol = e.ColumnIndex; sortAsc = e.ColumnIndex != 3 && e.ColumnIndex != 4; }
+                Populate();
+            };
+            appGrid.SelectionChanged += (s, e) => UpdateButtons();
+
+            leftGrid = AddGrid(gridRect);
+            var pick = DarkGrid.Col(leftGrid, "Pick", "", 10, false);
+            pick.AutoSizeMode = DataGridViewAutoSizeColumnMode.None;
+            pick.Width = 44;
+            DarkGrid.Col(leftGrid, "Type", "TYPE", 70, false);
+            DarkGrid.Col(leftGrid, "Path", "PATH", 420, false);
+            DarkGrid.Col(leftGrid, "Size", "SIZE", 80, true);
+            DarkGrid.Col(leftGrid, "Found", "FOUND AS", 150, false);
+            leftGrid.CellPainting += (s, e) =>
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex != 0) return;
+                var it = leftGrid.Rows[e.RowIndex].Tag as Leftover;
+                DarkGrid.Box(e, it != null && it.Checked);
+            };
+            leftGrid.CellClick += (s, e) => { if (e.RowIndex >= 0 && e.ColumnIndex == 0) Toggle(e.RowIndex); };
+            leftGrid.CellDoubleClick += (s, e) => { if (e.RowIndex >= 0 && e.ColumnIndex > 0) Toggle(e.RowIndex); };
+            leftGrid.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Space && leftGrid.SelectedRows.Count > 0) { e.SuppressKeyPress = true; Toggle(leftGrid.SelectedRows[0].Index); }
+            };
+            leftGrid.Parent.Visible = false;
+
+            int by = H - 2 - 20 - 38;
+            status = AddText("Loading\u2026", new Rectangle(25, by + 10, 340, 18), Theme.F(9f), Theme.Soft);
+            AddButton("Close", null, Theme.Secondary, new Rectangle(right - 110, by, 110, 38), Close);
+            uninstallBtn = AddButton("Uninstall", "\uE74D", Theme.Red, new Rectangle(right - 110 - 10 - 150, by, 150, 38), UninstallOrStop);
+            onlyBtn = AddButton("Remove leftovers only", "\uE8B7", Theme.Secondary, new Rectangle(right - 110 - 10 - 150 - 10 - 210, by, 210, 38), LeftoversOnly);
+            removeBtn = AddButton("Remove selected leftovers", "\uE74D", Theme.Red, new Rectangle(right - 110 - 10 - 260, by, 260, 38), RemoveSelected);
+            backBtn = AddButton("Back to the list", "\uE72B", Theme.Secondary, new Rectangle(right - 110 - 10 - 260 - 10 - 170, by, 170, 38), BackToList);
+            removeBtn.Visible = false;
+            backBtn.Visible = false;
+            UpdateButtons();
+            Shown += (s, e) => Reload();
+        }
+
+        protected override bool CanClose() { return !busy; }
+
+        // ---- the list
+
+        private InstalledApp Selected()
+        {
+            if (appGrid.SelectedRows.Count == 0) return null;
+            return appGrid.SelectedRows[0].Tag as InstalledApp;
+        }
+
+        private List<Leftover> Picked()
+        {
+            return leftGrid.Rows.Cast<DataGridViewRow>().Select(r => r.Tag as Leftover).Where(i => i != null && i.Checked).ToList();
+        }
+
+        private void Toggle(int rowIndex)
+        {
+            if (busy) return;
+            var it = leftGrid.Rows[rowIndex].Tag as Leftover;
+            if (it == null) return;
+            it.Checked = !it.Checked;
+            leftGrid.InvalidateCell(0, rowIndex);
+            UpdateButtons();
+        }
+
+        private void UpdateButtons()
+        {
+            if (uninstallBtn == null || onlyBtn == null || removeBtn == null || backBtn == null) return;
+            var a = Selected();
+            if (waiting)
+            {
+                uninstallBtn.Text = stopWait ? "Stopping\u2026" : "Stop waiting";
+                uninstallBtn.Enabled = !stopWait;
+            }
+            else
+            {
+                uninstallBtn.Text = "Uninstall";
+                uninstallBtn.Enabled = !busy && a != null;
+            }
+            onlyBtn.Enabled = !busy && a != null && a.Broken;
+            refreshBtn.Enabled = !busy;
+            int n = leftStep ? Picked().Count : 0;
+            removeBtn.Enabled = !busy && n > 0;
+            removeBtn.Text = n > 0 ? "Remove selected leftovers (" + n + ")" : "Remove selected leftovers";
+            backBtn.Enabled = !busy;
+        }
+
+        private void Reload()
+        {
+            if (busy) return;
+            busy = true;
+            appGrid.Rows.Clear();
+            status.ForeColor = Theme.Soft;
+            status.Text = "Loading\u2026";
+            UpdateButtons();
+            var th = new Thread(() =>
+            {
+                List<InstalledApp> list;
+                try { list = LoadApps(false); }
+                catch { list = new List<InstalledApp>(); }
+                Post(() =>
+                {
+                    busy = false;
+                    apps = list;
+                    Populate();
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private int Compare(InstalledApp x, InstalledApp y)
+        {
+            int c;
+            switch (sortCol)
+            {
+                case 1: c = string.Compare(x.Publisher, y.Publisher, IC); break;
+                case 2: c = string.Compare(x.Version, y.Version, IC); break;
+                case 3: c = x.SizeKb.CompareTo(y.SizeKb); break;
+                case 4: c = x.Installed.CompareTo(y.Installed); break;
+                case 5: c = string.Compare(x.Source, y.Source, IC); break;
+                default: c = string.Compare(x.Name, y.Name, IC); break;
+            }
+            if (!sortAsc) c = -c;
+            if (c == 0) c = string.Compare(x.Name, y.Name, IC);
+            return c;
+        }
+
+        private void Populate()
+        {
+            if (appGrid == null || searchBox == null || status == null) return;
+            var keep = Selected();
+            string q = searchBox.Text.Trim();
+            var view = apps.Where(a => q.Length == 0 || a.Name.IndexOf(q, IC) >= 0 || a.Publisher.IndexOf(q, IC) >= 0).ToList();
+            view.Sort(Compare);
+            appGrid.Rows.Clear();
+            foreach (var a in view)
+            {
+                int r = appGrid.Rows.Add(a.Name, a.Publisher, a.Version,
+                    a.SizeKb > 0 ? Theme.FormatBytes(a.SizeKb * 1024) : "\u2014",
+                    a.Installed == DateTime.MinValue ? "\u2014" : a.Installed.ToString("d MMM yyyy"),
+                    a.Source + (a.Broken ? "  \u00B7  uninstaller missing" : ""));
+                appGrid.Rows[r].Tag = a;
+                if (a.Broken) appGrid.Rows[r].DefaultCellStyle.ForeColor = Theme.Amber;
+            }
+            appGrid.ClearSelection();
+            if (keep != null)
+                foreach (DataGridViewRow row in appGrid.Rows)
+                    if (row.Tag == keep) { row.Selected = true; break; }
+            for (int i = 0; i < appGrid.Columns.Count; i++)
+                appGrid.Columns[i].HeaderCell.SortGlyphDirection = i == sortCol ? (sortAsc ? SortOrder.Ascending : SortOrder.Descending) : SortOrder.None;
+            if (!busy)
+            {
+                status.ForeColor = Theme.Soft;
+                status.Text = (view.Count == apps.Count ? apps.Count.ToString("N0") : view.Count.ToString("N0") + " of " + apps.Count.ToString("N0")) +
+                              (apps.Count == 1 ? " program" : " programs");
+            }
+            UpdateButtons();
+        }
+
+        private void BackToList()
+        {
+            if (busy) return;
+            leftStep = false;
+            current = null;
+            leftGrid.Rows.Clear();
+            leftGrid.Parent.Visible = false;
+            stepCaption.Visible = false;
+            stepText.Visible = false;
+            removeBtn.Visible = false;
+            backBtn.Visible = false;
+            searchCaption.Visible = true;
+            searchBox.Parent.Visible = true;
+            refreshBtn.Visible = true;
+            appGrid.Parent.Visible = true;
+            uninstallBtn.Visible = true;
+            onlyBtn.Visible = true;
+            Reload();
+        }
+
+        // ---- reading the Uninstall keys
+
+        private static RegistryKey OpenBase(RegistryHive hive)
+        {
+            return RegistryKey.OpenBaseKey(hive, Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default);
+        }
+
+        private static string HiveName(RegistryHive hive)
+        {
+            return hive == RegistryHive.CurrentUser ? "HKCU" : "HKLM";
+        }
+
+        private static string Str(RegistryKey k, string name)
+        {
+            try { return Convert.ToString(k.GetValue(name, "")) ?? ""; }
+            catch { return ""; }
+        }
+
+        /// all = false: the list the user sees (no system parts, updates or entries without an uninstaller).
+        /// all = true: every entry with a name, to check what other programs still use.
+        private static List<InstalledApp> LoadApps(bool all)
+        {
+            var list = new List<InstalledApp>();
+            ReadKey(list, RegistryHive.LocalMachine, UninstallKey, "All users", all);
+            if (Environment.Is64BitOperatingSystem) ReadKey(list, RegistryHive.LocalMachine, UninstallKey32, "All users (32-bit)", all);
+            ReadKey(list, RegistryHive.CurrentUser, UninstallKey, "This user", all);
+            return list;
+        }
+
+        private static void ReadKey(List<InstalledApp> list, RegistryHive hive, string path, string source, bool all)
+        {
+            try
+            {
+                using (var b = OpenBase(hive))
+                using (var k = b.OpenSubKey(path))
+                {
+                    if (k == null) return;
+                    foreach (var name in k.GetSubKeyNames())
+                    {
+                        try
+                        {
+                            using (var e = k.OpenSubKey(name))
+                            {
+                                if (e == null) continue;
+                                string dn = Str(e, "DisplayName").Trim();
+                                string un = Str(e, "UninstallString").Trim();
+                                if (dn.Length == 0) continue;
+                                if (dn.StartsWith("Vibe Stop Processing", IC) || name.IndexOf(SelfId, IC) >= 0) continue;
+                                if (!all)
+                                {
+                                    if (un.Length == 0) continue;
+                                    if (Str(e, "SystemComponent").Trim() == "1") continue;
+                                    if (Str(e, "ParentKeyName").Trim().Length > 0) continue;
+                                    string rt = Str(e, "ReleaseType").Trim();
+                                    if (rt.Equals("Update", IC) || rt.Equals("Hotfix", IC) || rt.Equals("Security Update", IC)) continue;
+                                    if (dn.StartsWith("Update for", IC) || dn.StartsWith("Security Update", IC) || dn.StartsWith("Hotfix", IC)) continue;
+                                }
+                                var a = new InstalledApp
+                                {
+                                    Name = dn, Publisher = Str(e, "Publisher").Trim(), Version = Str(e, "DisplayVersion").Trim(),
+                                    Source = source, Hive = hive, KeyName = name, KeyPath = path + "\\" + name, UninstallString = un,
+                                    InstallLocation = Str(e, "InstallLocation").Trim(), DisplayIcon = Str(e, "DisplayIcon").Trim()
+                                };
+                                object sz = e.GetValue("EstimatedSize");
+                                if (sz is int) a.SizeKb = (uint)(int)sz;
+                                else
+                                {
+                                    long kb;
+                                    if (long.TryParse(Convert.ToString(sz), out kb) && kb > 0) a.SizeKb = kb;
+                                }
+                                DateTime dt;
+                                if (DateTime.TryParseExact(Str(e, "InstallDate").Trim(), "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture,
+                                        System.Globalization.DateTimeStyles.None, out dt))
+                                    a.Installed = dt;
+                                if (!all)
+                                {
+                                    string f, args;
+                                    a.Broken = UninstallCommand(a, out f, out args) == null && !File.Exists(f);
+                                }
+                                list.Add(a);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static bool KeyExists(InstalledApp a)
+        {
+            try
+            {
+                using (var b = OpenBase(a.Hive))
+                using (var k = b.OpenSubKey(a.KeyPath))
+                    return k != null;
+            }
+            catch { return true; }
+        }
+
+        private static bool IsGuid(string s)
+        {
+            return !string.IsNullOrEmpty(s) && Regex.IsMatch(s, @"^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$");
+        }
+
+        /// Splits the UninstallString into the program to start and its arguments.
+        /// Returns null when it can be run, otherwise why not. Never goes through cmd.exe.
+        private static string UninstallCommand(InstalledApp a, out string file, out string args)
+        {
+            file = null;
+            args = "";
+            string s = (a.UninstallString ?? "").Trim();
+            try { s = Environment.ExpandEnvironmentVariables(s).Trim(); } catch { }
+            if (s.Length == 0) return "This program has no uninstall command.";
+            string sys = Environment.SystemDirectory;
+
+            // Windows Installer: always "msiexec /x {product code}", with its normal window
+            if (Regex.IsMatch(s, "^\"?([^\"]*\\\\)?msiexec(\\.exe)?\"?(\\s|$)", RegexOptions.IgnoreCase))
+            {
+                var m = Regex.Match(s, @"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}");
+                string g = m.Success ? m.Value : (IsGuid(a.KeyName) ? a.KeyName : null);
+                if (g == null) return "Its Windows Installer command has no product code.";
+                file = Path.Combine(sys, "msiexec.exe");
+                args = "/x " + g;
+                return null;
+            }
+
+            string rest;
+            if (s.StartsWith("\""))
+            {
+                int q = s.IndexOf('"', 1);
+                if (q < 2) return "Its uninstall command can't be read.";
+                file = s.Substring(1, q - 1).Trim();
+                rest = s.Substring(q + 1);
+            }
+            else if (Regex.IsMatch(s, @"^rundll32(\.exe)?(\s|$)", RegexOptions.IgnoreCase))
+            {
+                int sp = s.IndexOf(' ');
+                file = Path.Combine(sys, "rundll32.exe");
+                rest = sp < 0 ? "" : s.Substring(sp);
+            }
+            else
+            {
+                // an unquoted path that may contain spaces: the first prefix ending in ".exe" that exists
+                rest = "";
+                string firstExe = null, firstRest = "";
+                int from = 0;
+                while (from < s.Length)
+                {
+                    int i = s.IndexOf(".exe", from, IC);
+                    if (i < 0) break;
+                    int end = i + 4;
+                    if (end == s.Length || s[end] == ' ' || s[end] == '\t')
+                    {
+                        string cand = s.Substring(0, end);
+                        if (firstExe == null) { firstExe = cand; firstRest = s.Substring(end); }
+                        string full = cand;
+                        try { if (!Path.IsPathRooted(full)) full = Path.Combine(sys, full); } catch { }
+                        if (File.Exists(full)) { file = cand; rest = s.Substring(end); break; }
+                    }
+                    from = end;
+                }
+                if (file == null)
+                {
+                    if (firstExe != null) { file = firstExe; rest = firstRest; }
+                    else
+                    {
+                        int sp = s.IndexOf(' ');
+                        file = sp < 0 ? s : s.Substring(0, sp);
+                        rest = sp < 0 ? "" : s.Substring(sp);
+                    }
+                }
+            }
+            if (file.StartsWith(@"\??\")) file = file.Substring(4);
+            try { if (!Path.IsPathRooted(file)) file = Path.Combine(sys, file); }
+            catch { return "Its uninstall command can't be read."; }
+            args = (rest ?? "").Trim();
+            string nm = Path.GetFileName(file);
+            string ext = Path.GetExtension(file);
+            if (nm.Equals("cmd.exe", IC) || nm.Equals("cmd", IC) || ext.Equals(".bat", IC) || ext.Equals(".cmd", IC))
+                return "Its uninstall command runs through the Windows command prompt, which Vibe Stop Processing does not run. Remove it from Windows Settings > Apps instead.";
+            return null;
+        }
+
+        // ---- uninstalling
+
+        private void UninstallOrStop()
+        {
+            if (waiting)
+            {
+                stopWait = true;
+                UpdateButtons();
+                return;
+            }
+            var a = Selected();
+            if (busy || a == null) return;
+            string file, args;
+            string why = UninstallCommand(a, out file, out args);
+            if (why == null && !File.Exists(file))
+            {
+                int b = ThemedDialog.Show(this, "The uninstaller is missing",
+                    a.Name + " can't be uninstalled the normal way because its uninstaller no longer exists:\n\n" + file +
+                    "\n\nYou can still remove the folders and settings it left behind, and its entry in this list.",
+                    new[] { "Remove leftovers only", "Cancel" }, 0, Theme.Amber, 1);
+                if (b == 0) StartLeftoversOnly(a);
+                return;
+            }
+            if (why != null)
+            {
+                ThemedDialog.Show(this, "Can't run the uninstaller", a.Name + "\n\n" + why, new[] { "OK" }, 0, Theme.Amber);
+                return;
+            }
+            int ok = ThemedDialog.Show(this, "Uninstall " + a.Name + "?",
+                "Uninstall " + a.Name + "? Its own uninstaller will open first. After it finishes, Vibe Stop Processing looks for the folders and settings it left behind.",
+                new[] { "Uninstall", "Cancel" }, 0, Theme.Red, 1);
+            if (ok != 0) return;
+
+            busy = true;
+            waiting = true;
+            stopWait = false;
+            status.ForeColor = Theme.Soft;
+            status.Text = "Waiting for the " + a.Name + " uninstaller\u2026";
+            UpdateButtons();
+            if (log != null) log("App Uninstaller: started the uninstaller of " + a.Name);
+            string f2 = file, a2 = args;
+            var th = new Thread(() => RunUninstaller(a, f2, a2));
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void RunUninstaller(InstalledApp a, string file, string args)
+        {
+            DateTime launched = DateTime.Now;
+            int code = -1;
+            string error = null;
+            try
+            {
+                var psi = new ProcessStartInfo(file, args) { UseShellExecute = false, WorkingDirectory = Environment.SystemDirectory };
+                Process p;
+                // the uninstaller (and the copy of itself it often starts from %TEMP%) may take the
+                // foreground, so its window opens in front of this dialog instead of behind it
+                Native.AllowAnyForeground();
+                try { p = Process.Start(psi); }
+                catch (Win32Exception ex)
+                {
+                    if (ex.NativeErrorCode != 740) throw; // 740 = the uninstaller asks for elevation
+                    psi.UseShellExecute = true;
+                    psi.Verb = "runas";
+                    p = Process.Start(psi);
+                }
+                if (p != null)
+                    using (p)
+                    {
+                        while (!p.WaitForExit(500))
+                            if (stopWait) break;
+                        if (p.HasExited) code = p.ExitCode;
+                    }
+            }
+            catch (Exception ex) { error = ex.Message; }
+
+            if (error != null)
+            {
+                string err = error;
+                Post(() =>
+                {
+                    busy = false;
+                    waiting = false;
+                    status.ForeColor = Theme.Amber;
+                    status.Text = "Couldn't start the uninstaller: " + err;
+                    if (log != null) log("App Uninstaller: couldn't start the uninstaller of " + a.Name + ": " + err);
+                    UpdateButtons();
+                });
+                return;
+            }
+
+            // Many uninstallers copy themselves to %TEMP% and exit at once, so wait
+            // (up to 3 minutes) until the program's Uninstall key is gone.
+            bool gone = !KeyExists(a);
+            if (!gone && !stopWait && code != 1602 && code != 1223 && code != 1605)
+            {
+                Post(() => status.Text = "Waiting for the uninstall of " + a.Name + " to finish\u2026");
+                var sw = Stopwatch.StartNew();
+                int idle = 0;
+                while (sw.Elapsed.TotalMinutes < 3 && !stopWait)
+                {
+                    Thread.Sleep(1000);
+                    if (!KeyExists(a)) { gone = true; break; }
+                    if (sw.Elapsed.TotalSeconds < 8) continue;
+                    if (HelperRunning(launched, file, a)) idle = 0;
+                    else if (++idle >= 5) break; // nothing of the uninstaller is running any more
+                }
+            }
+            int c = code;
+            bool g = gone;
+            Post(() => AfterUninstall(a, g, c));
+        }
+
+        /// True while a process that belongs to the uninstall is still running:
+        /// started after it, from %TEMP%, Windows\Temp, the uninstaller's folder or the install folder.
+        private static bool HelperRunning(DateTime since, string file, InstalledApp a)
+        {
+            string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows).TrimEnd('\\') + "\\";
+            string parent = null;
+            try { parent = Path.GetDirectoryName(file); } catch { }
+            var dirs = new List<string>();
+            foreach (var d in new[] { Path.GetTempPath(), Path.Combine(win, "Temp"), parent, CleanDir(a.InstallLocation) })
+            {
+                if (string.IsNullOrEmpty(d)) continue;
+                string x = d.TrimEnd('\\') + "\\";
+                if (x.Length <= 4) continue;
+                if (x.StartsWith(win, IC) && !x.Equals(win + "Temp\\", IC)) continue; // System32 (msiexec, rundll32)
+                dirs.Add(x);
+            }
+            foreach (var p in Process.GetProcesses())
+            {
+                try
+                {
+                    if (p.StartTime < since.AddSeconds(-2)) continue;
+                    if (p.ProcessName.Equals("msiexec", IC)) return true;
+                    string path = MainForm.ExePath(p.Id);
+                    if (string.IsNullOrEmpty(path)) continue;
+                    if (path.Equals(file, IC)) return true;
+                    foreach (var d in dirs) if (path.StartsWith(d, IC)) return true;
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+            return false;
+        }
+
+        private void AfterUninstall(InstalledApp a, bool gone, int code)
+        {
+            if (IsDisposed) return;
+            waiting = false;
+            stopWait = false;
+            if (gone)
+            {
+                if (log != null) log("App Uninstaller: " + a.Name + " was uninstalled");
+                StartScan(a, false);
+                return;
+            }
+            if (code == 1602 || code == 1223)
+            {
+                busy = false;
+                status.ForeColor = Theme.Amber;
+                status.Text = "The uninstall was cancelled. Nothing else was changed.";
+                if (log != null) log("App Uninstaller: the uninstall of " + a.Name + " was cancelled");
+                UpdateButtons();
+                return;
+            }
+            int b;
+            if (code == 1605)
+                b = ThemedDialog.Show(this, "Not installed",
+                    "Windows Installer says " + a.Name + " is not installed, but it is still listed. Vibe Stop Processing can look for the folders and settings it left behind, and its entry in this list.",
+                    new[] { "Look for leftovers", "Cancel" }, 0, Theme.Blue);
+            else
+                b = ThemedDialog.Show(this, "Did the uninstall finish?",
+                    a.Name + " is still listed as installed. If its uninstaller finished, Vibe Stop Processing can look for the folders and settings it left behind.",
+                    new[] { "Look for leftovers", "Cancel" }, 0, Theme.Blue);
+            if (b == 0) { StartScan(a, code == 1605); return; }
+            busy = false;
+            if (log != null) log("App Uninstaller: stopped; " + a.Name + " is still installed");
+            status.ForeColor = Theme.Amber;
+            status.Text = a.Name + " is still installed.";
+            UpdateButtons();
+        }
+
+        private void LeftoversOnly()
+        {
+            var a = Selected();
+            if (busy || a == null || !a.Broken) return;
+            int b = ThemedDialog.Show(this, "Remove the leftovers of " + a.Name + "?",
+                "The uninstaller of " + a.Name + " no longer exists, so it can't run. Vibe Stop Processing will look for the folders and settings it left behind, and its broken entry in this list. You choose what to remove next.",
+                new[] { "Look for leftovers", "Cancel" }, 0, Theme.Blue);
+            if (b == 0) StartLeftoversOnly(a);
+        }
+
+        private void StartLeftoversOnly(InstalledApp a)
+        {
+            if (log != null) log("App Uninstaller: looking for the leftovers of " + a.Name + " (uninstaller missing)");
+            StartScan(a, true);
+        }
+
+        // ---- finding leftovers
+
+        private void StartScan(InstalledApp a, bool includeEntry)
+        {
+            busy = true;
+            current = a;
+            status.ForeColor = Theme.Soft;
+            status.Text = "Looking for the leftovers of " + a.Name + "\u2026";
+            UpdateButtons();
+            var th = new Thread(() =>
+            {
+                List<Leftover> found;
+                try { found = FindLeftovers(a, includeEntry, line => Post(() => status.Text = line)); }
+                catch { found = new List<Leftover>(); }
+                Post(() => ShowLeftovers(a, found));
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void ShowLeftovers(InstalledApp a, List<Leftover> found)
+        {
+            busy = false;
+            if (found.Count == 0)
+            {
+                if (log != null) log("App Uninstaller: no leftovers found for " + a.Name);
+                ThemedDialog.Show(this, "All clean", "No leftovers found \u2014 " + a.Name + " was removed cleanly.", new[] { "OK" }, 0, Theme.Green);
+                BackToList();
+                return;
+            }
+            leftStep = true;
+            searchCaption.Visible = false;
+            searchBox.Parent.Visible = false;
+            refreshBtn.Visible = false;
+            appGrid.Parent.Visible = false;
+            uninstallBtn.Visible = false;
+            onlyBtn.Visible = false;
+            stepCaption.Text = "WHAT " + a.Name.ToUpperInvariant() + " LEFT BEHIND";
+            stepCaption.Visible = true;
+            stepText.Text = "Checked items clearly belong to " + a.Name + ". Weaker matches start unchecked \u2014 check them only if you are sure. " +
+                            "Folders go to the Recycle Bin, and each registry key is backed up before it is removed.";
+            stepText.Visible = true;
+            leftGrid.Rows.Clear();
+            foreach (var it in found.OrderBy(x => x.IsKey).ThenByDescending(x => x.Checked).ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase))
+            {
+                int r = leftGrid.Rows.Add("", it.IsKey ? "Registry" : "Folder", it.Path, it.IsKey ? "\u2014" : Theme.FormatBytes(it.Size), it.Reason);
+                leftGrid.Rows[r].Tag = it;
+            }
+            leftGrid.Parent.Visible = true;
+            leftGrid.ClearSelection();
+            removeBtn.Visible = true;
+            backBtn.Visible = true;
+            int nf = found.Count(x => !x.IsKey), nk = found.Count(x => x.IsKey);
+            status.ForeColor = Theme.Soft;
+            status.Text = nf + (nf == 1 ? " folder" : " folders") + ", " + nk + (nk == 1 ? " registry key" : " registry keys") + " found";
+            if (log != null) log("App Uninstaller: found " + found.Count + " leftovers of " + a.Name);
+            UpdateButtons();
+        }
+
+        private static string CleanDir(string loc)
+        {
+            if (string.IsNullOrWhiteSpace(loc)) return null;
+            try
+            {
+                string d = Environment.ExpandEnvironmentVariables(loc.Trim().Trim('"')).TrimEnd('\\');
+                return d.Length > 3 && d[1] == ':' ? d : null;
+            }
+            catch { return null; }
+        }
+
+        /// The name without a trailing version or architecture: "7-Zip 23.01 (x64)" -> "7-Zip".
+        private static string StripVersion(string name)
+        {
+            string s = (name ?? "").Trim();
+            for (int i = 0; i < 4; i++)
+            {
+                string before = s;
+                s = Regex.Replace(s, @"\s*\([^)]*(\d+\.\d+|x64|x86|amd64|arm64|\d\d[- ]?bit)[^)]*\)\s*$", "", RegexOptions.IgnoreCase);
+                s = Regex.Replace(s, @"[\s,_-]+(version\s*|v)?\d+(\.\d+)+[\w.-]*\s*$", "", RegexOptions.IgnoreCase);
+                s = Regex.Replace(s, @"[\s,_-]+(x64|x86|amd64|arm64|win64|win32|64[- ]?bit|32[- ]?bit)\s*$", "", RegexOptions.IgnoreCase);
+                s = s.Trim().TrimEnd('-', ',', ':', '_').Trim();
+                if (s == before) break;
+            }
+            return s.Length > 0 ? s : (name ?? "").Trim();
+        }
+
+        /// "Contoso Software, Inc." -> "Contoso Software"
+        private static string StripCompany(string pub)
+        {
+            string s = (pub ?? "").Trim();
+            for (int i = 0; i < 3; i++)
+            {
+                string before = s;
+                s = Regex.Replace(s, @"[\s,]+(inc|incorporated|llc|l\.l\.c|ltd|limited|corp|corporation|co|company|gmbh|ag|sa|s\.a|bv|b\.v|pty|plc|srl|s\.r\.l)\.?$", "", RegexOptions.IgnoreCase);
+                s = s.Trim().TrimEnd(',', '.').Trim();
+                if (s == before) break;
+            }
+            return s;
+        }
+
+        private static List<string> NameKeys(string name)
+        {
+            var list = new List<string>();
+            foreach (var v in new[] { name, StripVersion(name) })
+            {
+                string n = LeftoversForm.Norm(v);
+                if (n.Length >= 3 && !list.Contains(n)) list.Add(n);
+            }
+            return list;
+        }
+
+        private static List<string> PublisherKeys(string pub)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrWhiteSpace(pub)) return list;
+            string raw = pub.Trim(), stripped = StripCompany(raw);
+            if (LeftoversForm.Skip(raw) || LeftoversForm.Skip(stripped)) return list; // Microsoft, Intel, ...
+            foreach (var v in new[] { raw, stripped })
+            {
+                string n = LeftoversForm.Norm(v);
+                if (n.Length >= 3 && !list.Contains(n)) list.Add(n);
+            }
+            return list;
+        }
+
+        /// True when the name matches another still-installed program (same normalised name, or 6+ letters in common at the start).
+        private static bool UsedByOther(string leaf, List<InstalledApp> others)
+        {
+            string n = LeftoversForm.Norm(leaf);
+            if (n.Length < 2) return true;
+            foreach (var o in others)
+                foreach (var on in NameKeys(o.Name))
+                    if (on == n || LeftoversForm.CommonPrefix(on, n) >= 6) return true;
+            return false;
+        }
+
+        private static bool PublisherUsed(string name, List<InstalledApp> others)
+        {
+            string n = LeftoversForm.Norm(name);
+            if (n.Length < 2) return true;
+            foreach (var o in others)
+            {
+                if (string.IsNullOrWhiteSpace(o.Publisher)) continue;
+                if (LeftoversForm.Norm(o.Publisher) == n || LeftoversForm.Norm(StripCompany(o.Publisher)) == n) return true;
+            }
+            return false;
+        }
+
+        private static bool Inside(string path, string dir)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(dir)) return false;
+            string p = path.TrimEnd('\\'), d = dir.TrimEnd('\\');
+            return p.Equals(d, IC) || p.StartsWith(d + "\\", IC);
+        }
+
+        private static List<string> SearchRoots()
+        {
+            var roots = new List<string>();
+            foreach (var r in new[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+            })
+                if (!string.IsNullOrEmpty(r) && !roots.Any(x => x.Equals(r, IC))) roots.Add(r.TrimEnd('\\'));
+            return roots;
+        }
+
+        private static List<string> SharedRoots(List<string> search)
+        {
+            var list = new List<string>(search);
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrEmpty(local))
+            {
+                list.Add(Path.Combine(local, "Programs"));
+                string up = Path.GetDirectoryName(local.TrimEnd('\\'));
+                if (!string.IsNullOrEmpty(up)) { list.Add(up); list.Add(Path.Combine(up, "LocalLow")); }
+            }
+            if (!string.IsNullOrEmpty(profile)) list.Add(profile);
+            foreach (var pf in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) })
+                if (!string.IsNullOrEmpty(pf)) list.Add(Path.Combine(pf, "Common Files"));
+            return list;
+        }
+
+        private static bool UnderProgramFiles(string dir)
+        {
+            foreach (var pf in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) })
+                if (!string.IsNullOrEmpty(pf) && dir.StartsWith(pf.TrimEnd('\\') + "\\", IC)) return true;
+            return false;
+        }
+
+        private class Context
+        {
+            public List<InstalledApp> Others;
+            public List<string> RegPaths, Running, Shared;
+            public string AppDir = "", DataDir = "";
+        }
+
+        private static List<Leftover> FindLeftovers(InstalledApp app, bool includeEntry, Action<string> progress)
+        {
+            progress("Reading the list of installed programs\u2026");
+            var cx = new Context();
+            cx.Others = LoadApps(true).Where(o => !(o.Hive == app.Hive && o.KeyPath.Equals(app.KeyPath, IC))).ToList();
+            bool still = KeyExists(app);
+            cx.RegPaths = new List<string>();
+            LeftoversForm.ReadInstalled(new HashSet<string>(), cx.RegPaths);
+            if (still)
+            {
+                // the entry is still there (the user chose to look anyway): its own paths don't count as "in use"
+                var mine = new List<string>();
+                foreach (var p in new[] { CleanDir(app.InstallLocation), LeftoversForm.PathOf(app.DisplayIcon), LeftoversForm.PathOf(app.UninstallString) })
+                    if (p != null) mine.Add(p);
+                cx.RegPaths.RemoveAll(x => mine.Any(m => m.Equals(x, IC)));
+            }
+            cx.Running = LeftoversForm.RunningPaths();
+            var search = SearchRoots();
+            cx.Shared = SharedRoots(search);
+            try { cx.AppDir = Path.GetDirectoryName(Application.ExecutablePath).TrimEnd('\\'); } catch { }
+            try { cx.DataDir = AppInfo.DataDir.TrimEnd('\\'); } catch { }
+
+            var names = NameKeys(app.Name);
+            var pubs = PublisherKeys(app.Publisher);
+            var found = new List<Leftover>();
+
+            progress("Looking for leftover folders\u2026");
+            string loc = CleanDir(app.InstallLocation);
+            if (loc != null) AddFolder(found, loc, true, "Install folder", cx);
+            foreach (var raw in new[] { app.DisplayIcon, app.UninstallString })
+            {
+                string exe = LeftoversForm.PathOf(raw);
+                if (exe == null) continue;
+                string dir;
+                try { dir = Path.GetDirectoryName(exe); } catch { continue; }
+                if (string.IsNullOrEmpty(dir) || !UnderProgramFiles(dir)) continue;
+                AddFolder(found, dir, false, "Uninstaller folder", cx);
+            }
+            if (names.Count > 0)
+                foreach (var root in search)
+                {
+                    string[] dirs;
+                    try { dirs = Directory.GetDirectories(root); } catch { continue; }
+                    foreach (var d in dirs)
+                    {
+                        string leaf = Path.GetFileName(d);
+                        string n = LeftoversForm.Norm(leaf);
+                        if (names.Contains(n)) AddFolder(found, d, true, "Same name", cx);
+                        if (!pubs.Contains(n) || LeftoversForm.Skip(leaf)) continue;
+                        string[] subs;
+                        try { subs = Directory.GetDirectories(d); } catch { continue; }
+                        foreach (var s in subs)
+                            if (names.Contains(LeftoversForm.Norm(Path.GetFileName(s)))) AddFolder(found, s, true, "Publisher folder", cx);
+                    }
+                }
+
+            progress("Looking for leftover settings in the registry\u2026");
+            if (names.Count > 0) FindKeys(found, names, pubs, cx.Others);
+            if (includeEntry && still)
+                found.Add(new Leftover
+                {
+                    IsKey = true, IsEntry = true, Checked = true, Hive = app.Hive, SubPath = app.KeyPath,
+                    Path = HiveName(app.Hive) + "\\" + app.KeyPath, Reason = "Broken uninstall entry"
+                });
+            return found;
+        }
+
+        private static void AddFolder(List<Leftover> found, string dir, bool strong, string reason, Context cx)
+        {
+            try
+            {
+                string d = Path.GetFullPath(dir).TrimEnd('\\');
+                var old = found.FirstOrDefault(x => !x.IsKey && x.Path.Equals(d, IC));
+                if (old != null)
+                {
+                    if (strong && !old.Checked) { old.Checked = true; old.Reason = reason; }
+                    return;
+                }
+                if (!FolderAllowed(d, cx)) return;
+                long size;
+                DateTime mod;
+                LeftoversForm.Measure(d, out size, out mod);
+                found.Add(new Leftover { Path = d, Size = size, Checked = strong, Reason = reason });
+            }
+            catch { }
+        }
+
+        private static bool FolderAllowed(string d, Context cx)
+        {
+            if (d.Length <= 3 || !Directory.Exists(d)) return false;
+            if ((File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) return false;
+            string leaf = Path.GetFileName(d);
+            if (LeftoversForm.Skip(leaf)) return false;
+            foreach (var r in cx.Shared)
+                if (Inside(r, d)) return false; // a shared root itself, or a folder that holds one
+            if (PermanentDeleteForm.SafetyCheck(d) != null) return false;
+            if (Inside(cx.AppDir, d) || Inside(d, cx.AppDir) || Inside(cx.DataDir, d) || Inside(d, cx.DataDir)) return false;
+            if (LeftoversForm.OnPath(d)) return false;
+            if (cx.RegPaths.Any(p => Inside(p, d))) return false; // a service, startup entry or other program lives inside
+            foreach (var o in cx.Others)
+                foreach (var op in new[] { CleanDir(o.InstallLocation), LeftoversForm.PathOf(o.DisplayIcon), LeftoversForm.PathOf(o.UninstallString) })
+                    if (op != null && Inside(op, d)) return false;
+            if (UsedByOther(leaf, cx.Others)) return false;
+            if (LeftoversForm.HasRunning(d, cx.Running)) return false;
+            return true;
+        }
+
+        private static bool BlockedKeyName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return true;
+            foreach (var x in SharedKeys) if (n.Equals(x, IC)) return true;
+            return LeftoversForm.Skip(n);
+        }
+
+        /// A key may be removed only when it is under Software\<name> (not a shared key),
+        /// or when it is the program's own entry under the Uninstall keys.
+        private static bool KeyAllowed(Leftover it)
+        {
+            string p = it.SubPath ?? "";
+            if (it.IsEntry)
+            {
+                foreach (var u in new[] { UninstallKey, UninstallKey32 })
+                    if (p.StartsWith(u + "\\", IC) && p.Length > u.Length + 1 && p.IndexOf('\\', u.Length + 1) < 0) return true;
+                return false;
+            }
+            var parts = p.Split('\\');
+            if (parts.Length < 2 || !parts[0].Equals("Software", IC)) return false;
+            int i = 1;
+            if (parts[1].Equals("WOW6432Node", IC))
+            {
+                if (it.Hive != RegistryHive.LocalMachine) return false;
+                i = 2;
+            }
+            if (parts.Length <= i) return false;
+            foreach (var part in parts) if (part.Length == 0) return false;
+            return !BlockedKeyName(parts[i]);
+        }
+
+        private static void AddKey(List<Leftover> found, RegistryHive hive, string sub, bool strong, string reason)
+        {
+            var old = found.FirstOrDefault(x => x.IsKey && x.Hive == hive && x.SubPath.Equals(sub, IC));
+            if (old != null)
+            {
+                if (strong && !old.Checked) { old.Checked = true; old.Reason = reason; }
+                return;
+            }
+            var it = new Leftover { IsKey = true, Hive = hive, SubPath = sub, Path = HiveName(hive) + "\\" + sub, Checked = strong, Reason = reason };
+            if (KeyAllowed(it)) found.Add(it);
+        }
+
+        private static void FindKeys(List<Leftover> found, List<string> names, List<string> pubs, List<InstalledApp> others)
+        {
+            var bases = new List<KeyValuePair<RegistryHive, string>>
+            {
+                new KeyValuePair<RegistryHive, string>(RegistryHive.CurrentUser, "Software"),
+                new KeyValuePair<RegistryHive, string>(RegistryHive.LocalMachine, "SOFTWARE")
+            };
+            if (Environment.Is64BitOperatingSystem) bases.Add(new KeyValuePair<RegistryHive, string>(RegistryHive.LocalMachine, @"SOFTWARE\WOW6432Node"));
+            foreach (var bp in bases)
+            {
+                try
+                {
+                    using (var b = OpenBase(bp.Key))
+                    using (var sw = b.OpenSubKey(bp.Value))
+                    {
+                        if (sw == null) continue;
+                        foreach (var sub in sw.GetSubKeyNames())
+                        {
+                            if (BlockedKeyName(sub)) continue;
+                            string n = LeftoversForm.Norm(sub);
+                            if (names.Contains(n) && !UsedByOther(sub, others) && !PublisherUsed(sub, others))
+                                AddKey(found, bp.Key, bp.Value + "\\" + sub, false, "Settings (same name)");
+                            if (!pubs.Contains(n)) continue;
+                            try
+                            {
+                                using (var pk = sw.OpenSubKey(sub))
+                                {
+                                    if (pk == null) continue;
+                                    var kids = pk.GetSubKeyNames();
+                                    int matched = 0;
+                                    foreach (var kid in kids)
+                                    {
+                                        if (!names.Contains(LeftoversForm.Norm(kid)) || LeftoversForm.Skip(kid) || UsedByOther(kid, others)) continue;
+                                        AddKey(found, bp.Key, bp.Value + "\\" + sub + "\\" + kid, true, "Settings (publisher)");
+                                        matched++;
+                                    }
+                                    // the publisher key itself only when nothing else is left in it and no other program uses that publisher
+                                    if (matched > 0 && matched == kids.Length && !PublisherUsed(sub, others))
+                                        AddKey(found, bp.Key, bp.Value + "\\" + sub, true, "Publisher key (now empty)");
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        // ---- removing
+
+        private void RemoveSelected()
+        {
+            var picked = Picked();
+            var app = current;
+            if (busy || picked.Count == 0 || app == null) return;
+            int nf = picked.Count(x => !x.IsKey), nk = picked.Count(x => x.IsKey);
+            var lines = picked.Take(8).Select(i => "\u2022  " + i.Path).ToArray();
+            string more = picked.Count > 8 ? "\n\u2026and " + (picked.Count - 8) + " more" : "";
+            string what = (nf > 0 ? nf + (nf == 1 ? " folder goes" : " folders go") + " to the Recycle Bin. " : "") +
+                          (nk > 0 ? nk + (nk == 1 ? " registry key is" : " registry keys are") + " saved to a .reg backup and then removed." : "");
+            int ok = ThemedDialog.Show(this, "Remove " + picked.Count + (picked.Count == 1 ? " leftover?" : " leftovers?"),
+                what.Trim() + "\n\n" + string.Join("\n", lines) + more, new[] { "Remove", "Cancel" }, 0, Theme.Red, 1);
+            if (ok != 0) return;
+
+            busy = true;
+            UpdateButtons();
+            string backupDir = Path.Combine(AppInfo.DataDir, "uninstall-backups");
+            var th = new Thread(() =>
+            {
+                var running = LeftoversForm.RunningPaths();
+                var moved = new List<Leftover>();
+                var removed = new List<Leftover>();
+                var failed = new List<string>();
+                int n = 0;
+                // folders first, then keys; inner items before the folder or key that holds them
+                foreach (var it in picked.OrderBy(x => x.IsKey).ThenByDescending(x => x.Path.Length))
+                {
+                    n++;
+                    int k = n;
+                    Post(() => status.Text = "Removing " + k + " of " + picked.Count + "\u2026");
+                    string why;
+                    try { why = it.IsKey ? RemoveKey(it, app, backupDir) : RemoveFolder(it, running); }
+                    catch (Exception ex) { why = ex.Message; }
+                    if (why != null) failed.Add(it.Path + ": " + why);
+                    else if (it.IsKey) removed.Add(it);
+                    else moved.Add(it);
+                }
+                long size = moved.Where(d => !moved.Any(o => o != d && d.Path.StartsWith(o.Path + "\\", IC))).Sum(d => Math.Max(0, d.Size));
+                Post(() =>
+                {
+                    busy = false;
+                    if (log != null)
+                    {
+                        foreach (var m in moved) log("App Uninstaller: moved to the Recycle Bin: " + m.Path);
+                        foreach (var r in removed) log("App Uninstaller: removed registry key " + r.Path + (r.Backup != null ? " (backup: " + r.Backup + ")" : ""));
+                        foreach (var f in failed) log("App Uninstaller: not removed: " + f);
+                    }
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append(moved.Count + (moved.Count == 1 ? " folder" : " folders") + " moved to the Recycle Bin (" + Theme.FormatBytes(size) + ").\n");
+                    sb.Append(removed.Count + (removed.Count == 1 ? " registry key" : " registry keys") + " removed.");
+                    if (removed.Any(r => r.Backup != null)) sb.Append("\n\nRegistry backup: " + backupDir + "\nDouble-click a .reg file there to restore a key.");
+                    if (failed.Count > 0)
+                        sb.Append("\n\nNot removed:\n" + string.Join("\n", failed.Take(6).ToArray()) + (failed.Count > 6 ? "\n\u2026and " + (failed.Count - 6) + " more" : ""));
+                    ThemedDialog.Show(this, failed.Count == 0 ? "Leftovers removed" : "Some leftovers were not removed", sb.ToString(),
+                        new[] { "OK" }, 0, failed.Count == 0 ? Theme.Green : Theme.Amber);
+                    BackToList();
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private static string RemoveFolder(Leftover it, List<string> running)
+        {
+            if (!Directory.Exists(it.Path)) return null; // already gone
+            if ((File.GetAttributes(it.Path) & FileAttributes.ReparsePoint) != 0) return "it is a link";
+            string why = PermanentDeleteForm.SafetyCheck(it.Path);
+            if (why != null) return why;
+            if (LeftoversForm.HasRunning(it.Path, running)) return "a program inside it is running";
+            return RecycleBin.Send(it.Path);
+        }
+
+        private static string SafeName(string s)
+        {
+            string n = Regex.Replace(s ?? "", @"[^A-Za-z0-9._-]+", "_").Trim('_', '.');
+            if (n.Length == 0) n = "program";
+            return n.Length > 60 ? n.Substring(0, 60) : n;
+        }
+
+        /// Exports the key with reg.exe, and removes it only when the backup was saved.
+        private static string RemoveKey(Leftover it, InstalledApp app, string backupDir)
+        {
+            if (!KeyAllowed(it)) return "this registry key is protected";
+            using (var b = OpenBase(it.Hive))
+            using (var k = b.OpenSubKey(it.SubPath))
+                if (k == null) return null; // already gone
+            string full = HiveName(it.Hive) + "\\" + it.SubPath;
+            if (full.IndexOf('"') >= 0) return "its name can't be backed up safely, so it was kept";
+            Directory.CreateDirectory(backupDir);
+            string baseName = SafeName(app.Name) + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            string file = Path.Combine(backupDir, baseName + ".reg");
+            for (int i = 2; File.Exists(file); i++) file = Path.Combine(backupDir, baseName + "-" + i + ".reg");
+            int code;
+            Native.Run(Path.Combine(Environment.SystemDirectory, "reg.exe"),
+                "export \"" + full + "\" \"" + file + "\" /y" + (Environment.Is64BitOperatingSystem ? " /reg:64" : ""), out code, 60000);
+            if (code != 0 || !File.Exists(file)) return "the backup could not be saved, so the key was kept";
+            it.Backup = file;
+            using (var b = OpenBase(it.Hive))
+                b.DeleteSubKeyTree(it.SubPath, false);
+            using (var b = OpenBase(it.Hive))
+            using (var k = b.OpenSubKey(it.SubPath))
+                if (k != null) return "it is still there (protected)";
+            return null;
         }
     }
 

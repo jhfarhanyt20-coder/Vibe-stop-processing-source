@@ -6,3 +6,11 @@ obj/
 .vs/
 .claude/
 dist/
+
+# never in git: logs, env files, keys, update leftovers
+*.log
+.env
+.env.*
+*.key
+*.download
+*.old
