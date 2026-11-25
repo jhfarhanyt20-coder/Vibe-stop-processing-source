@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -19,9 +19,9 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Vibe Stop Processing")]
 [assembly: AssemblyProduct("Vibe Stop Processing")]
-[assembly: AssemblyCompany("Vibe")]
+[assembly: AssemblyCompany("VibeCoder AI (Jamil Hussain)")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
-[assembly: AssemblyCopyright("Copyright (c) 2026 Vibe. All rights reserved.")]
+[assembly: AssemblyCopyright("Copyright (c) 2026 Jamil Hussain (JH Farhan), trading as VibeCoder AI. All rights reserved.")]
 [assembly: AssemblyVersion("2.5.3.0")]
 [assembly: AssemblyFileVersion("2.5.3.0")]
 
