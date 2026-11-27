@@ -1,6 +1,8 @@
 # BD All-in-One Tools: PC Shutdown Assistant
 
-A dark-themed Windows app by **Vibe** to run **right before you turn your PC off**.
+*Formerly Vibe Stop Processing. Same app, same settings, new name.*
+
+A dark-themed Windows app by **BDCoder AI** to run **right before you turn your PC off**.
 Press one button and every non-system app is closed one by one. The app also cleans temporary files, fixes a PC that **turns itself back on after shutdown**, includes one-click repair tools, and **keeps itself up to date**.
 
 > Windows 10 / 11 (64-bit) · standard Windows installer · runs on .NET Framework 4, which is already part of Windows
@@ -27,7 +29,7 @@ Once it's installed, the app updates itself. You don't need to download new vers
 - **Windows system processes are never touched.**
 - **No questions asked:** everything you started (browsers, editors, `node`, `bun`, terminals...) is stopped one by one in a single click. Windows processes and services are never touched.
 - Optional **"Shut down PC when finished"**, with a 15-second cancel window.
-- **Keep list:** apps you choose (Claude, Vibe Route and Stop Processing itself by default) are never stopped by Stop All. Right-click a process to add it, or manage the list in Settings.
+- **Keep list:** apps you choose (Claude, BD Route and BD All-in-One Tools itself by default) are never stopped by Stop All. Right-click a process to add it, or manage the list in Settings.
 
 ### 2. Cleaner: delete junk files in one click
 Cleans user and Windows temp files, the thumbnail cache, crash dumps, **browser cache** (Chrome, Edge, Brave, Opera, Vivaldi and Firefox, with logins and history kept), and optionally the Windows Update cache, Prefetch data and the Recycle Bin.
@@ -94,5 +96,5 @@ There is also a **This PC** panel with your Windows version, CPU, RAM, uptime an
 Found a problem or have an idea? Open an **[issue](../../issues)**.
 
 ## License
-**Proprietary. © 2026 Vibe. All rights reserved.**
+**Proprietary. © 2026 Jamil Hussain (JH Farhan), BDCoder AI. All rights reserved.**
 You may download and use the official release. You may not modify, reverse-engineer, redistribute or resell it. See [LICENSE](LICENSE).

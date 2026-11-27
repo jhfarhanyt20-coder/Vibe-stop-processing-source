@@ -1,6 +1,8 @@
 ﻿# BD All-in-One Tools: PC Shutdown Assistant
 
-A dark-themed Windows app by **Vibe** to run **right before you turn your PC off**.
+*Formerly Vibe Stop Processing. Same app, same settings, new name.*
+
+A dark-themed Windows app by **BDCoder AI** to run **right before you turn your PC off**.
 Press one button and every non-system app is closed one by one. The app also cleans temporary files, fixes a PC that **turns itself back on after shutdown**, and **keeps itself up to date**.
 
 > Windows 10 / 11 (64-bit) · standard Windows installer · runs on .NET Framework 4, which is already part of Windows
@@ -27,7 +29,7 @@ Running a newer installer over an existing install upgrades it in place.
 - **Windows system processes are never touched.** That covers `explorer`, `svchost`, `lsass`, Defender, drivers and anything in `C:\Windows`.
 - **No questions asked:** everything you started (browsers, editors, `node`, `bun`, terminals...) is stopped one by one in a single click. Windows processes and services are never touched.
 - Optional **"Shut down PC when finished"**: the PC powers off 15 seconds after the run, and you can cancel it in that time.
-- **Keep list:** apps you choose (Claude, Vibe Route and Stop Processing itself by default) are never stopped by Stop All. Right-click a process to add it, or manage the list in Settings.
+- **Keep list:** apps you choose (Claude, BD Route and BD All-in-One Tools itself by default) are never stopped by Stop All. Right-click a process to add it, or manage the list in Settings.
 
 ### 2. Cleaner: delete temp files in one click
 | Location | Default |
@@ -149,5 +151,5 @@ Requirements: Git, GitHub CLI (`gh`) signed in to the repository owner's account
 - Deleted temp files and an emptied Recycle Bin **cannot be recovered**.
 
 ## License
-**Proprietary. © 2026 Vibe. All rights reserved.**
+**Proprietary. © 2026 Jamil Hussain (JH Farhan), BDCoder AI. All rights reserved.**
 You may download and use the official release. You may not modify, reverse-engineer, redistribute or resell it. See [LICENSE](LICENSE).
