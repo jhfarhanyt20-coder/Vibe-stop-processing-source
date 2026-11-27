@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("VibeCoder AI (Jamil Hussain)")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Jamil Hussain (JH Farhan), trading as VibeCoder AI. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.7.0")]
-[assembly: AssemblyFileVersion("2.5.7.0")]
+[assembly: AssemblyVersion("2.5.8.0")]
+[assembly: AssemblyFileVersion("2.5.8.0")]
 
 namespace StopProcessing
 {
@@ -170,7 +170,7 @@ namespace StopProcessing
     static class AppInfo
     {
         public const string Owner = "jhfarhanyt20-coder";
-        public const string Repo = "Vibe-stop-processing";
+        public const string Repo = "BD-All-in-One-Tools";
         public const string AssetName = "StopProcessing.exe";
 
         public static Version Version

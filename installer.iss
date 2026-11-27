@@ -7,7 +7,7 @@
 
 #define AppName "BD All-in-One Tools"
 #define AppExe "StopProcessing.exe"
-#define AppUrl "https://github.com/jhfarhanyt20-coder/Vibe-stop-processing"
+#define AppUrl "https://github.com/jhfarhanyt20-coder/BD-All-in-One-Tools"
 
 [Setup]
 ; Never change AppId - Windows uses it to recognise upgrades and the uninstaller.

@@ -18,8 +18,8 @@ Set-Location $PSScriptRoot
 
 # Source code lives in the PRIVATE repo (git origin).
 # Users download from the PUBLIC repo, which only holds README, LICENSE and the releases.
-$PublicRepo = "jhfarhanyt20-coder/Vibe-stop-processing"
-$SourceRepo = "jhfarhanyt20-coder/Vibe-stop-processing-source"
+$PublicRepo = "jhfarhanyt20-coder/BD-All-in-One-Tools"
+$SourceRepo = "jhfarhanyt20-coder/BD-All-in-One-Tools-source"
 
 # Safety: this folder must be its OWN git repository whose origin is the private
 # source repo. If it sits inside another repository (for example a copy inside the
