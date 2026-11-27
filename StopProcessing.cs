@@ -27,6 +27,143 @@ using Microsoft.Win32;
 
 namespace StopProcessing
 {
+
+    /// <summary>
+    /// Quiet tray notes, the same everywhere in the VibeCoder apps: the Windows
+    /// note is shown without the system sound (NIIF_NOSOUND), the app plays its
+    /// own soft two-note chime instead, and the note leaves by itself after a
+    /// few seconds so it never sits over the user's work.
+    /// </summary>
+    internal static class QuietTip
+    {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct NOTIFYICONDATA
+        {
+            public int cbSize;
+            public IntPtr hWnd;
+            public int uID;
+            public int uFlags;
+            public int uCallbackMessage;
+            public IntPtr hIcon;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string szTip;
+            public int dwState;
+            public int dwStateMask;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string szInfo;
+            public int uTimeoutOrVersion;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string szInfoTitle;
+            public int dwInfoFlags;
+        }
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool Shell_NotifyIcon(int message, ref NOTIFYICONDATA data);
+        private const int NIM_MODIFY = 1, NIF_INFO = 0x10, NIIF_INFO = 1, NIIF_WARNING = 2, NIIF_NOSOUND = 0x10;
+
+        private static byte[] chime;
+        private static System.Windows.Forms.Timer hideTimer;
+
+        public static void Show(NotifyIcon tray, int ms, string title, string text, ToolTipIcon icon)
+        {
+            bool shown = false;
+            try
+            {
+                var idField = typeof(NotifyIcon).GetField("id", BindingFlags.NonPublic | BindingFlags.Instance);
+                var winField = typeof(NotifyIcon).GetField("window", BindingFlags.NonPublic | BindingFlags.Instance);
+                var nw = winField == null ? null : winField.GetValue(tray) as NativeWindow;
+                if (idField != null && nw != null && nw.Handle != IntPtr.Zero)
+                {
+                    tray.BalloonTipTitle = title; // so BalloonTipClicked can match the note
+                    tray.BalloonTipText = text;
+                    var d = new NOTIFYICONDATA();
+                    d.cbSize = Marshal.SizeOf(typeof(NOTIFYICONDATA));
+                    d.hWnd = nw.Handle;
+                    d.uID = (int)idField.GetValue(tray);
+                    d.uFlags = NIF_INFO;
+                    d.szInfo = text.Length > 255 ? text.Substring(0, 255) : text;
+                    d.szInfoTitle = title.Length > 63 ? title.Substring(0, 63) : title;
+                    d.uTimeoutOrVersion = ms;
+                    d.dwInfoFlags = (icon == ToolTipIcon.Warning || icon == ToolTipIcon.Error ? NIIF_WARNING : NIIF_INFO) | NIIF_NOSOUND;
+                    shown = Shell_NotifyIcon(NIM_MODIFY, ref d);
+                    if (shown) HideLater(nw.Handle, d.uID, 4000);
+                }
+            }
+            catch { shown = false; }
+            if (!shown) { try { tray.ShowBalloonTip(ms, title, text, icon); } catch { } }
+            PlayChime();
+        }
+
+        private static void HideLater(IntPtr hwnd, int id, int ms)
+        {
+            try
+            {
+                if (hideTimer != null) { hideTimer.Stop(); hideTimer.Dispose(); }
+                hideTimer = new System.Windows.Forms.Timer();
+                hideTimer.Interval = ms;
+                hideTimer.Tick += (s, e) =>
+                {
+                    hideTimer.Stop();
+                    try
+                    {
+                        var d = new NOTIFYICONDATA();
+                        d.cbSize = Marshal.SizeOf(typeof(NOTIFYICONDATA));
+                        d.hWnd = hwnd; d.uID = id; d.uFlags = NIF_INFO; d.szInfo = ""; d.szInfoTitle = "";
+                        Shell_NotifyIcon(NIM_MODIFY, ref d);
+                    }
+                    catch { }
+                };
+                hideTimer.Start();
+            }
+            catch { }
+        }
+
+        /// <summary>Two soft sine notes (E5 then B5) with a gentle fade, made in memory.</summary>
+        public static void PlayChime()
+        {
+            try
+            {
+                if (chime == null) chime = MakeChime();
+                var player = new System.Media.SoundPlayer(new MemoryStream(chime));
+                player.Play();
+            }
+            catch { }
+        }
+
+        private static byte[] MakeChime()
+        {
+            const int rate = 22050;
+            int total = (int)(rate * 0.75);
+            var samples = new double[total];
+            AddNote(samples, rate, 659.25, 0.00, 0.42);
+            AddNote(samples, rate, 987.77, 0.11, 0.55);
+            using (var ms = new MemoryStream())
+            using (var w = new BinaryWriter(ms))
+            {
+                int dataLen = total * 2;
+                w.Write(new[] { 'R', 'I', 'F', 'F' }); w.Write(36 + dataLen);
+                w.Write(new[] { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' }); w.Write(16);
+                w.Write((short)1); w.Write((short)1); w.Write(rate); w.Write(rate * 2); w.Write((short)2); w.Write((short)16);
+                w.Write(new[] { 'd', 'a', 't', 'a' }); w.Write(dataLen);
+                for (int i = 0; i < total; i++)
+                {
+                    double v = Math.Max(-1.0, Math.Min(1.0, samples[i]));
+                    w.Write((short)(v * 32767));
+                }
+                w.Flush();
+                return ms.ToArray();
+            }
+        }
+
+        private static void AddNote(double[] buf, int rate, double freq, double at, double len)
+        {
+            int start = (int)(at * rate), n = (int)(len * rate);
+            for (int i = 0; i < n && start + i < buf.Length; i++)
+            {
+                double t = (double)i / rate;
+                double attack = Math.Min(1.0, t / 0.018);
+                double fade = Math.Exp(-t * 7.5);
+                buf[start + i] += Math.Sin(2 * Math.PI * freq * t) * 0.22 * attack * fade;
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     //  App info, settings and the GitHub-Releases based updater
     // ------------------------------------------------------------------
@@ -1767,7 +1904,7 @@ namespace StopProcessing
                     if (!IsHandleCreated) CreateHandle();
                     value = false;
                     if (justUpdated)
-                        tray.ShowBalloonTip(4000, "Vibe Stop Processing updated",
+                        QuietTip.Show(tray, 4000, "Vibe Stop Processing updated",
                             "Now running version " + AppInfo.VersionText + ".", ToolTipIcon.Info);
                 }
             }
@@ -4290,7 +4427,7 @@ namespace StopProcessing
                         // automatic install is off: just let the user know, no pop-up at every start
                         try
                         {
-                            tray.ShowBalloonTip(5000, "Update available",
+                            QuietTip.Show(tray, 5000, "Update available",
                                 "Vibe Stop Processing " + info.Tag.TrimStart('v', 'V') + " is available. Open Settings or the tray menu to install it.", ToolTipIcon.Info);
                         }
                         catch { }
@@ -4344,7 +4481,7 @@ namespace StopProcessing
                         if (!automatic)
                             ThemedDialog.Show(this, "Update failed", error, new[] { "OK" }, 0, Theme.Red);
                         else
-                            try { tray.ShowBalloonTip(5000, "Update failed", error.Length > 200 ? error.Substring(0, 200) : error, ToolTipIcon.Warning); } catch { }
+                            try { QuietTip.Show(tray, 5000, "Update failed", error.Length > 200 ? error.Substring(0, 200) : error, ToolTipIcon.Warning); } catch { }
                         return;
                     }
 
@@ -4447,7 +4584,7 @@ namespace StopProcessing
             {
                 balloonTitle = title;
                 balloonAction = onClick;
-                tray.ShowBalloonTip(ms, title, text, icon);
+                QuietTip.Show(tray, ms, title, text, icon);
             }
             catch { }
         }
@@ -4948,7 +5085,7 @@ namespace StopProcessing
                 {
                     settings.TrayHintShown = true;
                     settings.Save();
-                    tray.ShowBalloonTip(5000, "Vibe Stop Processing is still running",
+                    QuietTip.Show(tray, 5000, "Vibe Stop Processing is still running",
                         "It's in the system tray. Right-click the icon and choose Exit to close it.", ToolTipIcon.Info);
                 }
                 return;
