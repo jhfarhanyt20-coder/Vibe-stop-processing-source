@@ -15,11 +15,11 @@ AppId={{8F3C2A71-5B4E-4D2A-9C61-7E2B5A9D4F10}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=Vibe
+AppPublisher=BDCoder AI (Jamil Hussain)
 AppPublisherURL={#AppUrl}
 AppSupportURL={#AppUrl}
 AppUpdatesURL={#AppUrl}/releases
-AppCopyright=Copyright (c) 2026 Vibe. All rights reserved.
+AppCopyright=Copyright (c) 2026 Jamil Hussain (JH Farhan), BDCoder AI. All rights reserved.
 DefaultDirName={autopf}\Vibe\Stop Processing
 DefaultGroupName=Vibe
 DisableProgramGroupPage=yes
@@ -38,7 +38,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=yes
 VersionInfoVersion={#AppVersion}.0
-VersionInfoCompany=Vibe
+VersionInfoCompany=BDCoder AI
 VersionInfoProductName={#AppName}
 VersionInfoDescription={#AppName} Setup
 
@@ -69,3 +69,6 @@ Type: files; Name: "{app}\{#AppExe}.old"
 Type: files; Name: "{app}\{#AppExe}.download"
 Type: files; Name: "{app}\{#AppExe}.*.old"
 Type: filesandordirs; Name: "{localappdata}\StopProcessing"
+; shortcuts renamed by the app after the BD rename (older installs)
+Type: files; Name: "{commondesktop}\Vibe Stop Processing.lnk"
+Type: files; Name: "{commonprograms}\Vibe Stop Processing.lnk"

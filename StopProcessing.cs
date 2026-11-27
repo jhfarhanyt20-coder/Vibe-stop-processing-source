@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("VibeCoder AI (Jamil Hussain)")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Jamil Hussain (JH Farhan), trading as VibeCoder AI. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.6.0")]
-[assembly: AssemblyFileVersion("2.5.6.0")]
+[assembly: AssemblyVersion("2.5.7.0")]
+[assembly: AssemblyFileVersion("2.5.7.0")]
 
 namespace StopProcessing
 {
@@ -5200,10 +5200,47 @@ namespace StopProcessing
             Application.ThreadException += (s, e) => ReportCrash(e.Exception, false);
             AppDomain.CurrentDomain.UnhandledException += (s, e) => ReportCrash(e.ExceptionObject as Exception, e.IsTerminating);
 
+            RenameOldBrand();
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
             GC.KeepAlive(singleInstance);
+        }
+
+        /// In-app updates only swap the exe, so shortcuts and "Apps & features" kept the old
+        /// name "Vibe Stop Processing". Rename them once to "BD All-in-One Tools".
+        static void RenameOldBrand()
+        {
+            const string oldName = "Vibe Stop Processing", newName = "BD All-in-One Tools";
+            var folders = new[] {
+                Environment.SpecialFolder.CommonDesktopDirectory, Environment.SpecialFolder.DesktopDirectory,
+                Environment.SpecialFolder.CommonPrograms, Environment.SpecialFolder.Programs };
+            foreach (var f in folders)
+            {
+                try
+                {
+                    string dir = Environment.GetFolderPath(f);
+                    if (string.IsNullOrEmpty(dir)) continue;
+                    string from = Path.Combine(dir, oldName + ".lnk"), to = Path.Combine(dir, newName + ".lnk");
+                    if (!File.Exists(from)) continue;
+                    if (File.Exists(to)) File.Delete(from); else File.Move(from, to);
+                }
+                catch { }
+            }
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A71-5B4E-4D2A-9C61-7E2B5A9D4F10}_is1", true))
+                {
+                    if (k != null)
+                    {
+                        if (Convert.ToString(k.GetValue("DisplayName")) == oldName) k.SetValue("DisplayName", newName);
+                        if (Convert.ToString(k.GetValue("Publisher")) == "Vibe") k.SetValue("Publisher", "BDCoder AI (Jamil Hussain)");
+                    }
+                }
+            }
+            catch { }
         }
     }
 
