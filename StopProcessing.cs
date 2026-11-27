@@ -20,10 +20,10 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("BD All-in-One Tools")]
 [assembly: AssemblyProduct("BD All-in-One Tools")]
 [assembly: AssemblyCompany("VibeCoder AI (Jamil Hussain)")]
-[assembly: AssemblyDescription("PC Shutdown Assistant")]
+[assembly: AssemblyDescription("BD All-in-One Tools - PC tools for Windows")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Jamil Hussain (JH Farhan), trading as VibeCoder AI. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.8.0")]
-[assembly: AssemblyFileVersion("2.5.8.0")]
+[assembly: AssemblyVersion("2.5.9.0")]
+[assembly: AssemblyFileVersion("2.5.9.0")]
 
 namespace StopProcessing
 {
@@ -8742,21 +8742,21 @@ namespace StopProcessing
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var logo = new Rectangle(14, 9, 22, 22);
             using (var p = Theme.Round(logo, 6))
-            using (var b = new LinearGradientBrush(logo, Color.FromArgb(240, 92, 70), Color.FromArgb(196, 40, 60), 45f))
+            using (var b = new SolidBrush(Color.FromArgb(224, 64, 72)))
                 g.FillPath(b, p);
-            TextRenderer.DrawText(g, "\uE7E8", Theme.Icon(8.5f), logo, Color.White,
+            TextRenderer.DrawText(g, "B", Theme.F(10f, FontStyle.Bold), logo, Color.White,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             var tf = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
             var bf = Theme.F(9.5f, FontStyle.Bold);
-            int bw = TextRenderer.MeasureText(g, "VIBE", bf, Size.Empty, tf).Width;
-            TextRenderer.DrawText(g, "VIBE", bf, new Rectangle(46, 0, bw + 4, Height), Color.FromArgb(240, 92, 70), tf);
-            string name = "Stop Processing";
+            int bw = TextRenderer.MeasureText(g, "BD", bf, Size.Empty, tf).Width;
+            TextRenderer.DrawText(g, "BD", bf, new Rectangle(46, 0, bw + 4, Height), Color.FromArgb(224, 64, 72), tf);
+            string name = "All-in-One Tools";
             var nf = Theme.Semi(9.5f);
             int nx = 46 + bw + 6;
             int nw = TextRenderer.MeasureText(g, name, nf, Size.Empty, tf).Width;
             TextRenderer.DrawText(g, name, nf, new Rectangle(nx, 0, nw + 4, Height), Theme.Text, tf);
-            TextRenderer.DrawText(g, "PC Shutdown Assistant", Theme.F(9f), new Rectangle(nx + nw + 10, 0, 220, Height), Theme.Faint, tf);
+            TextRenderer.DrawText(g, "PC Tools for Windows", Theme.F(9f), new Rectangle(nx + nw + 10, 0, 220, Height), Theme.Faint, tf);
 
             using (var pen = new Pen(Color.FromArgb(30, 34, 40)))
                 g.DrawLine(pen, 0, Height - 1, Width, Height - 1);
