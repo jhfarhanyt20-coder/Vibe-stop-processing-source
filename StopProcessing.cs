@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("VibeCoder AI (Jamil Hussain)")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Jamil Hussain (JH Farhan), trading as VibeCoder AI. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.4.0")]
-[assembly: AssemblyFileVersion("2.5.4.0")]
+[assembly: AssemblyVersion("2.5.5.0")]
+[assembly: AssemblyFileVersion("2.5.5.0")]
 
 namespace StopProcessing
 {
@@ -325,7 +325,9 @@ namespace StopProcessing
 
         /// Reads latest.json from the newest GitHub release (no API rate limit).
         /// Falls back to the GitHub API if the release has no latest.json.
-        public static UpdateInfo FetchLatest()
+        public static UpdateInfo FetchLatest() { return FetchLatest(0); }
+
+        private static UpdateInfo FetchLatest(int retry)
         {
             try
             {
@@ -368,7 +370,15 @@ namespace StopProcessing
             }
             catch (WebException)
             {
-                return FetchLatestFromApi();
+                if (retry < 2) { Thread.Sleep(1500 * (retry + 1)); return FetchLatest(retry + 1); }
+                try { return FetchLatestFromApi(); }
+                catch (WebException wex)
+                {
+                    var r = wex.Response as HttpWebResponse;
+                    if (r != null && ((int)r.StatusCode == 403 || (int)r.StatusCode == 429))
+                        throw new Exception("GitHub is limiting update checks from your network right now. Please try again in a few minutes.");
+                    throw;
+                }
             }
         }
 
@@ -423,20 +433,26 @@ namespace StopProcessing
         }
 
         /// Downloads the new exe next to the current one and verifies it.
-        public static string Download(UpdateInfo i, Action<int> percent)
+        private static bool IsBusy(WebException wex)
         {
-            if (!AppInfo.InSafeFolder) throw new Exception(AppInfo.NotInstalledText);
-            if (string.IsNullOrEmpty(i.Sha256) || i.Sha256.Length != 64) throw new Exception("The update has no checksum \u2014 update rejected.");
-            string expected = "https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/download/";
-            if (string.IsNullOrEmpty(i.Url) || !i.Url.StartsWith(expected, StringComparison.OrdinalIgnoreCase))
-                throw new Exception("The update does not come from the official release page \u2014 update rejected.");
+            var r = wex.Response as HttpWebResponse;
+            if (r == null) return wex.Status == WebExceptionStatus.Timeout || wex.Status == WebExceptionStatus.ConnectFailure || wex.Status == WebExceptionStatus.NameResolutionFailure;
+            int c = (int)r.StatusCode;
+            return c == 403 || c == 429 || c >= 500;
+        }
 
-            string tmp = Exe + ".download";
-            if (File.Exists(tmp)) File.Delete(tmp);
+        private static string BusyText(WebException wex)
+        {
+            var r = wex.Response as HttpWebResponse;
+            if (r != null && ((int)r.StatusCode == 403 || (int)r.StatusCode == 429))
+                return "GitHub is limiting downloads from your network right now. Please try again in a few minutes.";
+            return wex.Message;
+        }
 
-            // follow GitHub's download redirects by hand: https only
-            string url = i.Url;
-            HttpWebResponse first = null;
+        /// GitHub's download redirects, followed by hand (https only).
+        private static HttpWebResponse OpenDownload(string start)
+        {
+            string url = start;
             for (int hop = 0; hop < 6; hop++)
             {
                 var r = Request(url);
@@ -450,13 +466,37 @@ namespace StopProcessing
                     if (string.IsNullOrEmpty(next)) throw new Exception("Download failed (empty redirect).");
                     var nu = new Uri(new Uri(url), next);
                     if (nu.Scheme != Uri.UriSchemeHttps) throw new Exception("Download was redirected to an insecure address \u2014 update rejected.");
-                    url = nu.ToString();
+                    url = nu.AbsoluteUri;
                     continue;
                 }
-                first = resp0;
-                break;
+                return resp0;
             }
-            if (first == null) throw new Exception("Download failed (too many redirects).");
+            throw new Exception("Download failed (too many redirects).");
+        }
+
+        public static string Download(UpdateInfo i, Action<int> percent)
+        {
+            if (!AppInfo.InSafeFolder) throw new Exception(AppInfo.NotInstalledText);
+            if (string.IsNullOrEmpty(i.Sha256) || i.Sha256.Length != 64) throw new Exception("The update has no checksum \u2014 update rejected.");
+            string expected = "https://github.com/" + AppInfo.Owner + "/" + AppInfo.Repo + "/releases/download/";
+            if (string.IsNullOrEmpty(i.Url) || !i.Url.StartsWith(expected, StringComparison.OrdinalIgnoreCase))
+                throw new Exception("The update does not come from the official release page \u2014 update rejected.");
+
+            string tmp = Exe + ".download";
+            if (File.Exists(tmp)) File.Delete(tmp);
+
+            // GitHub sometimes answers 403/429/5xx for a moment (busy, or many
+            // checks from one network): start again a few times before giving up.
+            HttpWebResponse first = null;
+            for (int attempt = 1; first == null; attempt++)
+            {
+                try { first = OpenDownload(i.Url); }
+                catch (WebException wex)
+                {
+                    if (attempt >= 4 || !IsBusy(wex)) throw new Exception(BusyText(wex));
+                    Thread.Sleep(attempt * 3000);
+                }
+            }
 
             using (var resp = first)
             using (var src = resp.GetResponseStream())
