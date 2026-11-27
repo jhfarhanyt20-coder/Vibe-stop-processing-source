@@ -1,4 +1,4 @@
-﻿# Vibe Stop Processing: PC Shutdown Assistant
+﻿# BD All-in-One Tools: PC Shutdown Assistant
 
 A dark-themed Windows app by **Vibe** to run **right before you turn your PC off**.
 Press one button and every non-system app is closed one by one. The app also cleans temporary files, fixes a PC that **turns itself back on after shutdown**, and **keeps itself up to date**.
@@ -77,7 +77,7 @@ Running a newer installer over an existing install upgrades it in place.
 | **App Uninstaller** | Lists every installed program and removes it together with the files and settings it leaves behind |
 
 #### 🧹 App Uninstaller
-Pick any installed program and press **Uninstall**. Its own uninstaller runs first; when it is done, Vibe Stop Processing looks for what the program left behind (its install folder, its data in AppData and ProgramData, and its settings in the registry) and removes it in one click.
+Pick any installed program and press **Uninstall**. Its own uninstaller runs first; when it is done, BD All-in-One Tools looks for what the program left behind (its install folder, its data in AppData and ProgramData, and its settings in the registry) and removes it in one click.
 - Items that clearly belong to the program are ticked for you; weaker matches are left for you to decide.
 - Folders go to the **Recycle Bin**, and every registry key is **backed up** to a `.reg` file before it is removed.
 - Folders used by another installed program are never touched.
@@ -106,7 +106,7 @@ The **This PC** panel shows the Windows version, CPU, RAM use, uptime, and free 
 
 ## How to use
 1. Download and run `VibeStopProcessing-Setup-x.y.z.exe` from the [Releases page](../../releases/latest).
-2. Open **Vibe Stop Processing** from the Start Menu and press **Yes** on the UAC prompt. The app needs administrator rights to change power settings and to clean `C:\Windows\Temp`.
+2. Open **BD All-in-One Tools** from the Start Menu and press **Yes** on the UAC prompt. The app needs administrator rights to change power settings and to clean `C:\Windows\Temp`.
 3. Before turning the PC off:
    - **Cleaner** → **Clean Now**
    - **Processes** → tick *Shut down PC when finished* → **Stop All Processes**

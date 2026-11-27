@@ -1,4 +1,4 @@
-# Publishes a new version of Vibe Stop Processing.
+# Publishes a new version of BD All-in-One Tools.
 # Version rule:
 #   normal release  -> last number +1   (2.5.0 -> 2.5.1 -> 2.5.2 ...)
 #   -Minor          -> middle number +1 (2.5.2 -> 2.6.0)   for bigger feature updates
@@ -69,7 +69,7 @@ if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
 $setup = "dist\VibeStopProcessing-Setup-$Version.exe"
 
 # 4. latest.json - what the in-app updater reads (no GitHub API rate limit)
-if (-not $Notes) { $Notes = "Vibe Stop Processing v$Version" }
+if (-not $Notes) { $Notes = "BD All-in-One Tools v$Version" }
 $exe = Get-Item StopProcessing.exe
 $manifest = [ordered]@{
     version = $Version
@@ -103,7 +103,7 @@ if ($LASTEXITCODE -ne 0) { throw "pushing the tag failed - nothing was published
 #    - VibeStopProcessing-Setup-x.y.z.exe : for new users
 #    - StopProcessing.exe + latest.json   : used by the in-app auto updater
 gh release create "v$Version" $setup StopProcessing.exe dist\latest.json --repo $PublicRepo --target main `
-    --title "Vibe Stop Processing v$Version" --notes $Notes
+    --title "BD All-in-One Tools v$Version" --notes $Notes
 if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed. Check https://github.com/$PublicRepo/releases" }
 
 # 7. make sure every file the updater and new users need is really there

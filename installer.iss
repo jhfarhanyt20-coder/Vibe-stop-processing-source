@@ -1,11 +1,11 @@
-; Vibe Stop Processing - Windows installer (Inno Setup 6)
+; BD All-in-One Tools - Windows installer (Inno Setup 6)
 ; Built by release.ps1:  ISCC.exe /DAppVersion=x.y.z installer.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
 
-#define AppName "Vibe Stop Processing"
+#define AppName "BD All-in-One Tools"
 #define AppExe "StopProcessing.exe"
 #define AppUrl "https://github.com/jhfarhanyt20-coder/Vibe-stop-processing"
 

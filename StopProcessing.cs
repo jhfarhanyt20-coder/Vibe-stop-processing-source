@@ -17,13 +17,13 @@ using System.Security.Cryptography;
 using System.Web.Script.Serialization;
 using Microsoft.Win32;
 
-[assembly: AssemblyTitle("Vibe Stop Processing")]
-[assembly: AssemblyProduct("Vibe Stop Processing")]
+[assembly: AssemblyTitle("BD All-in-One Tools")]
+[assembly: AssemblyProduct("BD All-in-One Tools")]
 [assembly: AssemblyCompany("VibeCoder AI (Jamil Hussain)")]
 [assembly: AssemblyDescription("PC Shutdown Assistant")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Jamil Hussain (JH Farhan), trading as VibeCoder AI. All rights reserved.")]
-[assembly: AssemblyVersion("2.5.5.0")]
-[assembly: AssemblyFileVersion("2.5.5.0")]
+[assembly: AssemblyVersion("2.5.6.0")]
+[assembly: AssemblyFileVersion("2.5.6.0")]
 
 namespace StopProcessing
 {
@@ -610,7 +610,7 @@ namespace StopProcessing
             string xml =
                 "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
                 "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
-                "  <RegistrationInfo><Author>Vibe</Author><Description>Starts Vibe Stop Processing in the system tray when you sign in.</Description></RegistrationInfo>\r\n" +
+                "  <RegistrationInfo><Author>Vibe</Author><Description>Starts BD All-in-One Tools in the system tray when you sign in.</Description></RegistrationInfo>\r\n" +
                 "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + Esc(user) + "</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>\r\n" +
                 "  <Principals><Principal id=\"Author\"><UserId>" + Esc(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n" +
                 "  <Settings>\r\n" +
@@ -1834,7 +1834,7 @@ namespace StopProcessing
         {
             isAdmin = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
 
-            Text = "Vibe Stop Processing";
+            Text = "BD All-in-One Tools";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(1200, 760);
@@ -1901,7 +1901,7 @@ namespace StopProcessing
                 menu.Items.Add(mi);
                 return mi;
             };
-            var open = item("Open Vibe Stop Processing", (s, e) => ShowFromTray(-1));
+            var open = item("Open BD All-in-One Tools", (s, e) => ShowFromTray(-1));
             open.Font = Theme.F(9.5f, FontStyle.Bold);
             menu.Items.Add(new ToolStripSeparator());
             item("Processes", (s, e) => ShowFromTray(0));
@@ -1922,7 +1922,7 @@ namespace StopProcessing
             tray = new NotifyIcon
             {
                 Icon = Icon ?? SystemIcons.Application,
-                Text = "Vibe Stop Processing",
+                Text = "BD All-in-One Tools",
                 ContextMenuStrip = menu,
                 Visible = true
             };
@@ -1944,7 +1944,7 @@ namespace StopProcessing
                     if (!IsHandleCreated) CreateHandle();
                     value = false;
                     if (justUpdated)
-                        QuietTip.Show(tray, 4000, "Vibe Stop Processing updated",
+                        QuietTip.Show(tray, 4000, "BD All-in-One Tools updated",
                             "Now running version " + AppInfo.VersionText + ".", ToolTipIcon.Info);
                 }
             }
@@ -1956,7 +1956,7 @@ namespace StopProcessing
             base.OnShown(e);
             if (justUpdated)
                 ThemedDialog.Show(this, "Update installed",
-                    "Vibe Stop Processing was updated to version " + AppInfo.VersionText + ".", new[] { "OK" }, 0, Theme.Green);
+                    "BD All-in-One Tools was updated to version " + AppInfo.VersionText + ".", new[] { "OK" }, 0, Theme.Green);
         }
 
         public void ShowFromTray(int page)
@@ -4341,7 +4341,7 @@ namespace StopProcessing
                 "reverse-engineering or redistributing this software is not allowed.", Theme.F(8.5f), Theme.Faint, ContentAlignment.TopLeft);
             lic.AutoEllipsis = false;
 
-            a.Controls.Add(MakeLabel("Vibe Stop Processing", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
+            a.Controls.Add(MakeLabel("BD All-in-One Tools", Theme.F(12f, FontStyle.Bold), Theme.Text), 0, 0);
             a.Controls.Add(MakeLabel("Version " + AppInfo.VersionText, Theme.F(9f), Theme.Blue), 0, 1);
             a.Controls.Add(desc, 0, 2);
             a.Controls.Add(site, 0, 3);
@@ -4468,7 +4468,7 @@ namespace StopProcessing
                         try
                         {
                             QuietTip.Show(tray, 5000, "Update available",
-                                "Vibe Stop Processing " + info.Tag.TrimStart('v', 'V') + " is available. Open Settings or the tray menu to install it.", ToolTipIcon.Info);
+                                "BD All-in-One Tools " + info.Tag.TrimStart('v', 'V') + " is available. Open Settings or the tray menu to install it.", ToolTipIcon.Info);
                         }
                         catch { }
                     }
@@ -4542,7 +4542,7 @@ namespace StopProcessing
                         return;
                     }
                     int ans = ThemedDialog.Show(this, "Update ready",
-                        "Vibe Stop Processing " + info.Tag.TrimStart('v', 'V') + " has been installed. Restart the app now to use it?",
+                        "BD All-in-One Tools " + info.Tag.TrimStart('v', 'V') + " has been installed. Restart the app now to use it?",
                         new[] { "Restart now", "Later" }, 0, Theme.Green);
                     if (ans == 0)
                     {
@@ -4673,7 +4673,7 @@ namespace StopProcessing
             schedAt = null;
             if (schedTimer != null) schedTimer.Stop();
             if (traySchedCancel != null) traySchedCancel.Visible = false;
-            SetTrayText("Vibe Stop Processing");
+            SetTrayText("BD All-in-One Tools");
             AddLog(toolsLog, "Scheduled shutdown cancelled.");
             if (fromTray) ShowBalloon(4000, "Shutdown cancelled", "The scheduled shutdown was cancelled.", ToolTipIcon.Info, null);
         }
@@ -4692,13 +4692,13 @@ namespace StopProcessing
                 schedAt = null;
                 schedTimer.Stop();
                 if (traySchedCancel != null) traySchedCancel.Visible = false;
-                SetTrayText("Vibe Stop Processing");
+                SetTrayText("BD All-in-One Tools");
                 AddLog(toolsLog, "Scheduled shutdown: shutting down now.");
                 if (stopAll && !isStopping) StartStopAll(() => DoFullShutdown(clean));
                 else DoFullShutdown(clean);
                 return;
             }
-            SetTrayText("Vibe Stop Processing \u2014 shutdown in " + ScheduleShutdownForm.Fmt(left));
+            SetTrayText("BD All-in-One Tools \u2014 shutdown in " + ScheduleShutdownForm.Fmt(left));
             if (!schedWarned && left.TotalSeconds <= 60)
             {
                 schedWarned = true;
@@ -4910,7 +4910,7 @@ namespace StopProcessing
             t.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
             t.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-            var hint = MakeLabel("Stop All never stops these apps (process names). Vibe Stop Processing itself is always kept.",
+            var hint = MakeLabel("Stop All never stops these apps (process names). BD All-in-One Tools itself is always kept.",
                 Theme.F(8.5f), Theme.Muted, ContentAlignment.TopLeft);
 
             var row = Table(3, 1, Theme.Card);
@@ -5125,7 +5125,7 @@ namespace StopProcessing
                 {
                     settings.TrayHintShown = true;
                     settings.Save();
-                    QuietTip.Show(tray, 5000, "Vibe Stop Processing is still running",
+                    QuietTip.Show(tray, 5000, "BD All-in-One Tools is still running",
                         "It's in the system tray. Right-click the icon and choose Exit to close it.", ToolTipIcon.Info);
                 }
                 return;
@@ -5171,9 +5171,9 @@ namespace StopProcessing
             if (Interlocked.Exchange(ref crashShown, 1) == 1 && !fatal) return;
             try
             {
-                MessageBox.Show((fatal ? "Vibe Stop Processing has to close because of an unexpected error." : "Something went wrong, but the app keeps running.") +
+                MessageBox.Show((fatal ? "BD All-in-One Tools has to close because of an unexpected error." : "Something went wrong, but the app keeps running.") +
                     "\n\n" + (ex == null ? "" : ex.Message) + "\n\nDetails were saved to error.log in " + AppInfo.DataDir + ".",
-                    "Vibe Stop Processing", MessageBoxButtons.OK, fatal ? MessageBoxIcon.Error : MessageBoxIcon.Warning);
+                    "BD All-in-One Tools", MessageBoxButtons.OK, fatal ? MessageBoxIcon.Error : MessageBoxIcon.Warning);
             }
             catch { }
         }
@@ -6628,7 +6628,7 @@ namespace StopProcessing
             AddCaption("STATUS", 25, 290, 200);
             countdown = AddText("", new Rectangle(24, 308, right - 24, 34), Theme.F(16f, FontStyle.Bold), Theme.Muted);
             whenLabel = AddText("", new Rectangle(25, 344, right - 25, 20), Theme.F(9.5f), Theme.Soft);
-            var note = AddText("The schedule is kept only while Vibe Stop Processing is running. It is not saved, so closing or restarting the app cancels it.",
+            var note = AddText("The schedule is kept only while BD All-in-One Tools is running. It is not saved, so closing or restarting the app cancels it.",
                 new Rectangle(25, 374, right - 25, 38), Theme.F(8.5f), Theme.Faint);
             note.AutoEllipsis = false;
 
@@ -7836,7 +7836,7 @@ namespace StopProcessing
                                 string dn = Str(e, "DisplayName").Trim();
                                 string un = Str(e, "UninstallString").Trim();
                                 if (dn.Length == 0) continue;
-                                if (dn.StartsWith("Vibe Stop Processing", IC) || name.IndexOf(SelfId, IC) >= 0) continue;
+                                if (dn.StartsWith("BD All-in-One Tools", IC) || name.IndexOf(SelfId, IC) >= 0) continue;
                                 if (!all)
                                 {
                                     if (un.Length == 0) continue;
@@ -7969,7 +7969,7 @@ namespace StopProcessing
             string nm = Path.GetFileName(file);
             string ext = Path.GetExtension(file);
             if (nm.Equals("cmd.exe", IC) || nm.Equals("cmd", IC) || ext.Equals(".bat", IC) || ext.Equals(".cmd", IC))
-                return "Its uninstall command runs through the Windows command prompt, which Vibe Stop Processing does not run. Remove it from Windows Settings > Apps instead.";
+                return "Its uninstall command runs through the Windows command prompt, which BD All-in-One Tools does not run. Remove it from Windows Settings > Apps instead.";
             return null;
         }
 
@@ -8002,7 +8002,7 @@ namespace StopProcessing
                 return;
             }
             int ok = ThemedDialog.Show(this, "Uninstall " + a.Name + "?",
-                "Uninstall " + a.Name + "? Its own uninstaller will open first. After it finishes, Vibe Stop Processing looks for the folders and settings it left behind.",
+                "Uninstall " + a.Name + "? Its own uninstaller will open first. After it finishes, BD All-in-One Tools looks for the folders and settings it left behind.",
                 new[] { "Uninstall", "Cancel" }, 0, Theme.Red, 1);
             if (ok != 0) return;
 
@@ -8142,11 +8142,11 @@ namespace StopProcessing
             int b;
             if (code == 1605)
                 b = ThemedDialog.Show(this, "Not installed",
-                    "Windows Installer says " + a.Name + " is not installed, but it is still listed. Vibe Stop Processing can look for the folders and settings it left behind, and its entry in this list.",
+                    "Windows Installer says " + a.Name + " is not installed, but it is still listed. BD All-in-One Tools can look for the folders and settings it left behind, and its entry in this list.",
                     new[] { "Look for leftovers", "Cancel" }, 0, Theme.Blue);
             else
                 b = ThemedDialog.Show(this, "Did the uninstall finish?",
-                    a.Name + " is still listed as installed. If its uninstaller finished, Vibe Stop Processing can look for the folders and settings it left behind.",
+                    a.Name + " is still listed as installed. If its uninstaller finished, BD All-in-One Tools can look for the folders and settings it left behind.",
                     new[] { "Look for leftovers", "Cancel" }, 0, Theme.Blue);
             if (b == 0) { StartScan(a, code == 1605); return; }
             busy = false;
@@ -8161,7 +8161,7 @@ namespace StopProcessing
             var a = Selected();
             if (busy || a == null || !a.Broken) return;
             int b = ThemedDialog.Show(this, "Remove the leftovers of " + a.Name + "?",
-                "The uninstaller of " + a.Name + " no longer exists, so it can't run. Vibe Stop Processing will look for the folders and settings it left behind, and its broken entry in this list. You choose what to remove next.",
+                "The uninstaller of " + a.Name + " no longer exists, so it can't run. BD All-in-One Tools will look for the folders and settings it left behind, and its broken entry in this list. You choose what to remove next.",
                 new[] { "Look for leftovers", "Cancel" }, 0, Theme.Blue);
             if (b == 0) StartLeftoversOnly(a);
         }
@@ -8764,7 +8764,7 @@ namespace StopProcessing
             TextRenderer.DrawText(g,
                 admin ? "Running as administrator" : "Limited mode \u2014 run as administrator for Power Fix and full cleaning",
                 Theme.F(8.5f), new Rectangle(28, 0, Width - 200, Height), Theme.Muted, tf);
-            TextRenderer.DrawText(g, "Vibe Stop Processing " + AppInfo.VersionText, Theme.F(8.5f), new Rectangle(0, 0, Width - 14, Height), Theme.Faint,
+            TextRenderer.DrawText(g, "BD All-in-One Tools " + AppInfo.VersionText, Theme.F(8.5f), new Rectangle(0, 0, Width - 14, Height), Theme.Faint,
                 tf | TextFormatFlags.Right);
         }
     }
